@@ -10,7 +10,7 @@ const {
     getStudentsByUpcomingEMI
 } = require("../services/chatService");
 const { ensureWhatsAppConnection, getWhatsAppStatus } = require("../services/whatsappService");
-const { isPendingPaymentStatus } = require("../utils/paymentStatus");
+const { isPendingPaymentStatus } = require("./paymentStatus");
 
 const router = express.Router();
 
