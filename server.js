@@ -794,6 +794,11 @@ async function resolveKhazanaBookFileForUser({ uid, classLevel, bookId }) {
 
     const bookConfig = await getKhazanaBookDefinition(classLevel, bookId);
     if (!bookConfig) {
+        const fallbackStoredBook = await resolveStoredKhazanaBookFileByPrefix(classLevel, bookId);
+        if (fallbackStoredBook) {
+            return fallbackStoredBook;
+        }
+
         throw new Error("Requested Khazana book is not configured.");
     }
 
@@ -813,6 +818,11 @@ async function resolveKhazanaBookFileForUser({ uid, classLevel, bookId }) {
         };
     }
 
+    const storedBook = await resolveStoredKhazanaBookFileByPrefix(classLevel, bookId);
+    if (storedBook) {
+        return storedBook;
+    }
+
     return null;
 }
 
@@ -830,13 +840,45 @@ async function getKhazanaBookDefinition(classLevel, bookId) {
     return books.find((book) => String(book?.id || "").trim() === bookId) || null;
 }
 
+async function resolveStoredKhazanaBookFileByPrefix(classLevel, bookId) {
+    const prefix = `paid-notes/${classLevel}/${bookId}/`;
+
+    try {
+        const [files] = await storageBucket.getFiles({ prefix });
+        const pdfFiles = files
+            .filter((file) => String(file?.name || "").trim().toLowerCase().endsWith(".pdf"))
+            .sort((left, right) => String(right.name || "").localeCompare(String(left.name || "")));
+
+        const latestFile = pdfFiles[0];
+        if (!latestFile?.name) {
+            return null;
+        }
+
+        return {
+            storagePath: String(latestFile.name || "").trim(),
+            fileName: sanitizeDownloadFileName(path.basename(String(latestFile.name || "").trim()))
+        };
+    } catch (error) {
+        console.warn(`Unable to scan Khazana storage fallback for ${classLevel}/${bookId}:`, error?.message || error);
+        return null;
+    }
+}
+
 function extractStoragePathFromKhazanaBook(book = {}) {
-    const configuredPath = String(book.storagePath || "").trim();
+    const configuredPath = firstNonEmptyValue(
+        book.storagePath,
+        book.filePath,
+        book.pdfPath,
+        book.pdfStoragePath,
+        book.path
+    );
     if (configuredPath) {
         return configuredPath;
     }
 
-    return extractStoragePathFromFileUrl(book.fileUrl);
+    return extractStoragePathFromFileUrl(
+        firstNonEmptyValue(book.fileUrl, book.url, book.downloadUrl, book.pdfUrl)
+    );
 }
 
 async function resolveLegacyKhazanaResource(classLevel, bookConfig = {}) {
@@ -866,18 +908,36 @@ async function resolveLegacyKhazanaResource(classLevel, bookConfig = {}) {
             continue;
         }
 
-        const storagePath = String(resource.storagePath || "").trim() || extractStoragePathFromFileUrl(resource.fileUrl || resource.url);
+        const storagePath = firstNonEmptyValue(
+            resource.storagePath,
+            resource.filePath,
+            resource.pdfPath,
+            resource.path
+        ) || extractStoragePathFromFileUrl(
+            firstNonEmptyValue(resource.fileUrl, resource.url, resource.downloadUrl, resource.pdfUrl)
+        );
         if (!storagePath) {
             continue;
         }
 
         return {
             storagePath,
-            fileName: String(resource.fileName || "").trim()
+            fileName: firstNonEmptyValue(resource.fileName, resource.name, resource.title)
         };
     }
 
     return null;
+}
+
+function firstNonEmptyValue(...values) {
+    for (const value of values) {
+        const normalized = String(value || "").trim();
+        if (normalized) {
+            return normalized;
+        }
+    }
+
+    return "";
 }
 
 function extractStoragePathFromFileUrl(value) {
