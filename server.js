@@ -833,6 +833,11 @@ async function resolveKhazanaBookFileForUser({ uid, classLevel, bookId }) {
         return storedBook;
     }
 
+    const classFolderBook = await resolveStoredKhazanaBookFileByClassFolder(classLevel, bookConfig);
+    if (classFolderBook) {
+        return classFolderBook;
+    }
+
     return null;
 }
 
@@ -870,6 +875,57 @@ async function resolveStoredKhazanaBookFileByPrefix(classLevel, bookId) {
         };
     } catch (error) {
         console.warn(`Unable to scan Khazana storage fallback for ${classLevel}/${bookId}:`, error?.message || error);
+        return null;
+    }
+}
+
+async function resolveStoredKhazanaBookFileByClassFolder(classLevel, bookConfig = {}) {
+    const prefix = `paid-notes/${classLevel}/`;
+    const subjectCandidates = buildKhazanaSubjectCandidates(bookConfig);
+
+    if (!subjectCandidates.size) {
+        return null;
+    }
+
+    try {
+        const [files] = await storageBucket.getFiles({ prefix });
+        const pdfFiles = files.filter((file) => {
+            const name = String(file?.name || "").trim().toLowerCase();
+            return name.endsWith(".pdf");
+        });
+
+        const matches = pdfFiles
+            .map((file) => ({
+                file,
+                name: String(file?.name || "").trim(),
+                updatedAt: getMillis(file?.metadata?.updated || file?.metadata?.timeCreated || 0)
+            }))
+            .filter(({ name }) => {
+                const normalized = normalizeSubjectLookupKey(name);
+                if (!normalized) return false;
+
+                for (const candidate of subjectCandidates) {
+                    if (!candidate) continue;
+                    if (normalized.includes(candidate) || candidate.includes(normalized)) {
+                        return true;
+                    }
+                }
+
+                return false;
+            })
+            .sort((left, right) => Number(right.updatedAt || 0) - Number(left.updatedAt || 0));
+
+        const latestMatch = matches[0];
+        if (!latestMatch?.name) {
+            return null;
+        }
+
+        return {
+            storagePath: latestMatch.name,
+            fileName: sanitizeDownloadFileName(path.basename(latestMatch.name))
+        };
+    } catch (error) {
+        console.warn(`Unable to scan class-folder Khazana storage fallback for ${classLevel}:`, error?.message || error);
         return null;
     }
 }
@@ -1031,12 +1087,19 @@ function getSubjectAliases(value) {
         HINDI: ["HINDI", "HIN"],
         ENGLISH: ["ENGLISH", "ENG"],
         MATHS: ["MATHS", "MATH", "MATHEMATICS"],
+        MATHEMATICS: ["MATHS", "MATH", "MATHEMATICS"],
         SCIENCE: ["SCIENCE", "SCIE"],
+        SCIE: ["SCIENCE", "SCIE"],
         SST: ["SST", "SOCIALSCIENCE", "SOCIALSTUDIES", "SOCIAL"],
         SOCIALSCIENCE: ["SST", "SOCIALSCIENCE", "SOCIALSTUDIES", "SOCIAL"],
+        SOCIALSTUDIES: ["SST", "SOCIALSCIENCE", "SOCIALSTUDIES", "SOCIAL"],
+        SOCIAL: ["SST", "SOCIALSCIENCE", "SOCIALSTUDIES", "SOCIAL"],
         PHYSICS: ["PHYSICS", "PHY"],
+        PHY: ["PHYSICS", "PHY"],
         CHEMISTRY: ["CHEMISTRY", "CHEM"],
-        BIOLOGY: ["BIOLOGY", "BIO"]
+        CHEM: ["CHEMISTRY", "CHEM"],
+        BIOLOGY: ["BIOLOGY", "BIO"],
+        BIO: ["BIOLOGY", "BIO"]
     };
 
     return aliasMap[normalized] || [normalized];
