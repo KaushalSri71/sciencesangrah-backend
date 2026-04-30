@@ -51,6 +51,8 @@ const firestore = admin.firestore();
 const storageBucket = admin.storage().bucket();
 const app = express();
 let classConfigRefreshPromise = null;
+const BOOK_FILE_RESOLUTION_CACHE_TTL_MS = 10 * 60 * 1000;
+const bookFileResolutionCache = new Map();
 
 app.use(cors({
     origin(origin, callback) {
@@ -244,6 +246,8 @@ app.post(
                 }
             });
 
+            clearKhazanaBookResolutionCache(classLevel, bookId);
+
             res.json({
                 success: true,
                 storagePath,
@@ -271,6 +275,7 @@ app.post("/api/admin/khazana/storage-file/delete", verifyFirebaseUser, requireAd
             return;
         }
 
+        clearKhazanaBookResolutionCacheByStoragePath(storagePath);
         await storageBucket.file(storagePath).delete({ ignoreNotFound: true });
         res.json({
             success: true,
@@ -734,8 +739,9 @@ function requireRazorpayCredentials() {
 
 function normalizeClassLevel(value) {
     const raw = String(value || "").trim();
-    if (raw === "10" || raw === "10th") return "10th";
-    if (raw === "12" || raw === "12th") return "12th";
+    const compact = raw.toLowerCase().replace(/\s+/g, "");
+    if (["10", "10th", "class10", "class10th", "10thclass", "classx", "x", "std10"].includes(compact)) return "10th";
+    if (["12", "12th", "class12", "class12th", "12thclass", "classxii", "xii", "std12"].includes(compact)) return "12th";
     return "";
 }
 
@@ -792,6 +798,11 @@ async function assertPurchasedKhazanaClass(uid, classLevel) {
 async function resolveKhazanaBookFileForUser({ uid, classLevel, bookId }) {
     await assertPurchasedKhazanaClass(uid, classLevel);
 
+    const cached = readKhazanaBookResolutionCache(classLevel, bookId);
+    if (cached) {
+        return cached;
+    }
+
     const bookConfig = await getKhazanaBookDefinition(classLevel, bookId);
     if (!bookConfig) {
         const legacyResource = await resolveLegacyKhazanaResource(classLevel, {
@@ -801,12 +812,25 @@ async function resolveKhazanaBookFileForUser({ uid, classLevel, bookId }) {
             subjectKey: inferSubjectLabelFromBookId(bookId)
         });
         if (legacyResource?.storagePath) {
+            writeKhazanaBookResolutionCache(classLevel, bookId, legacyResource);
             return legacyResource;
         }
 
         const fallbackStoredBook = await resolveStoredKhazanaBookFileByPrefix(classLevel, bookId);
         if (fallbackStoredBook) {
+            writeKhazanaBookResolutionCache(classLevel, bookId, fallbackStoredBook);
             return fallbackStoredBook;
+        }
+
+        const fallbackLegacyStoredBook = await resolveStoredKhazanaBookFileByLegacyPrefixes(classLevel, {
+            id: bookId,
+            name: inferSubjectLabelFromBookId(bookId),
+            titleLabel: inferSubjectLabelFromBookId(bookId),
+            subjectKey: inferSubjectLabelFromBookId(bookId)
+        });
+        if (fallbackLegacyStoredBook) {
+            writeKhazanaBookResolutionCache(classLevel, bookId, fallbackLegacyStoredBook);
+            return fallbackLegacyStoredBook;
         }
 
         throw new Error("Requested Khazana book is not configured.");
@@ -814,28 +838,52 @@ async function resolveKhazanaBookFileForUser({ uid, classLevel, bookId }) {
 
     const directStoragePath = extractStoragePathFromKhazanaBook(bookConfig);
     if (directStoragePath) {
-        return {
+        const resolved = {
             storagePath: directStoragePath,
             fileName: buildKhazanaBookFileName(classLevel, bookConfig)
         };
+        writeKhazanaBookResolutionCache(classLevel, bookId, resolved);
+        return resolved;
     }
 
     const legacyResource = await resolveLegacyKhazanaResource(classLevel, bookConfig);
     if (legacyResource?.storagePath) {
-        return {
+        const resolved = {
             storagePath: legacyResource.storagePath,
             fileName: legacyResource.fileName || buildKhazanaBookFileName(classLevel, bookConfig)
         };
+        writeKhazanaBookResolutionCache(classLevel, bookId, resolved);
+        void persistKhazanaBookStorageMapping(classLevel, bookId, resolved).catch((error) => {
+            console.warn(`Unable to persist recovered Khazana mapping for ${classLevel}/${bookId}:`, error?.message || error);
+        });
+        return resolved;
     }
 
     const storedBook = await resolveStoredKhazanaBookFileByPrefix(classLevel, bookId);
     if (storedBook) {
+        writeKhazanaBookResolutionCache(classLevel, bookId, storedBook);
+        void persistKhazanaBookStorageMapping(classLevel, bookId, storedBook).catch((error) => {
+            console.warn(`Unable to persist recovered Khazana mapping for ${classLevel}/${bookId}:`, error?.message || error);
+        });
         return storedBook;
     }
 
     const classFolderBook = await resolveStoredKhazanaBookFileByClassFolder(classLevel, bookConfig);
     if (classFolderBook) {
+        writeKhazanaBookResolutionCache(classLevel, bookId, classFolderBook);
+        void persistKhazanaBookStorageMapping(classLevel, bookId, classFolderBook).catch((error) => {
+            console.warn(`Unable to persist recovered Khazana mapping for ${classLevel}/${bookId}:`, error?.message || error);
+        });
         return classFolderBook;
+    }
+
+    const legacyStoredBook = await resolveStoredKhazanaBookFileByLegacyPrefixes(classLevel, bookConfig);
+    if (legacyStoredBook) {
+        writeKhazanaBookResolutionCache(classLevel, bookId, legacyStoredBook);
+        void persistKhazanaBookStorageMapping(classLevel, bookId, legacyStoredBook).catch((error) => {
+            console.warn(`Unable to persist recovered Khazana mapping for ${classLevel}/${bookId}:`, error?.message || error);
+        });
+        return legacyStoredBook;
     }
 
     return null;
@@ -930,6 +978,29 @@ async function resolveStoredKhazanaBookFileByClassFolder(classLevel, bookConfig 
     }
 }
 
+async function resolveStoredKhazanaBookFileByLegacyPrefixes(classLevel, bookConfig = {}) {
+    const subjectCandidates = buildKhazanaSubjectCandidates(bookConfig);
+    const prefixes = buildLegacyStoragePrefixes(classLevel, bookConfig);
+
+    if (!subjectCandidates.size || !prefixes.length) {
+        return null;
+    }
+
+    for (const prefix of prefixes) {
+        try {
+            const [files] = await storageBucket.getFiles({ prefix });
+            const match = pickBestMatchingStoredPdf(files, classLevel, bookConfig, subjectCandidates);
+            if (match) {
+                return match;
+            }
+        } catch (error) {
+            console.warn(`Unable to scan legacy Khazana storage prefix ${prefix}:`, error?.message || error);
+        }
+    }
+
+    return null;
+}
+
 function extractStoragePathFromKhazanaBook(book = {}) {
     const configuredPath = firstNonEmptyValue(
         book.storagePath,
@@ -959,11 +1030,12 @@ async function resolveLegacyKhazanaResource(classLevel, bookConfig = {}) {
 
     for (const docSnapshot of snapshot.docs) {
         const resource = docSnapshot.data() || {};
-        if (String(resource.resourceType || "").trim().toLowerCase() !== "notes") {
+        const relevanceScore = getLegacyKhazanaResourceScore(resource);
+        if (relevanceScore <= 0) {
             continue;
         }
 
-        if (normalizeClassLevel(resource.classLevel) !== classLevel) {
+        if (resolveKhazanaResourceClassLevel(resource) !== classLevel) {
             continue;
         }
 
@@ -975,9 +1047,11 @@ async function resolveLegacyKhazanaResource(classLevel, bookConfig = {}) {
             resource.storagePath,
             resource.filePath,
             resource.pdfPath,
+            resource.pdfStoragePath,
+            resource.downloadPath,
             resource.path
         ) || extractStoragePathFromFileUrl(
-            firstNonEmptyValue(resource.fileUrl, resource.url, resource.downloadUrl, resource.pdfUrl)
+            firstNonEmptyValue(resource.fileUrl, resource.url, resource.downloadUrl, resource.pdfUrl, resource.link)
         );
         if (!storagePath) {
             continue;
@@ -986,11 +1060,18 @@ async function resolveLegacyKhazanaResource(classLevel, bookConfig = {}) {
         matches.push({
             storagePath,
             fileName: firstNonEmptyValue(resource.fileName, resource.name, resource.title),
+            score: relevanceScore,
             updatedAt: getMillis(resource.updatedAt || resource.updated_at || resource.createdAt || resource.timestamp)
         });
     }
 
-    matches.sort((left, right) => Number(right.updatedAt || 0) - Number(left.updatedAt || 0));
+    matches.sort((left, right) => {
+        if (Number(right.score || 0) !== Number(left.score || 0)) {
+            return Number(right.score || 0) - Number(left.score || 0);
+        }
+
+        return Number(right.updatedAt || 0) - Number(left.updatedAt || 0);
+    });
 
     if (matches[0]) {
         return {
@@ -1034,8 +1115,10 @@ function doesResourceMatchKhazanaSubject(resource = {}, subjectCandidates = new 
         resource.fileName,
         resource.storagePath,
         resource.filePath,
+        resource.downloadPath,
         resource.fileUrl,
-        resource.url
+        resource.url,
+        resource.link
     ];
 
     const normalizedValues = new Set();
@@ -1105,6 +1188,237 @@ function getSubjectAliases(value) {
     return aliasMap[normalized] || [normalized];
 }
 
+function resolveKhazanaResourceClassLevel(resource = {}) {
+    return normalizeClassLevel(
+        firstNonEmptyValue(
+            resource.classLevel,
+            resource.class,
+            resource.standard,
+            resource.className,
+            resource.class_name
+        )
+    );
+}
+
+function getLegacyKhazanaResourceScore(resource = {}) {
+    const resourceType = String(resource.resourceType || resource.type || "").trim().toLowerCase();
+    if (!resourceType) {
+        return 4;
+    }
+
+    if (["notes", "topper"].includes(resourceType)) {
+        return 7;
+    }
+
+    if (["ncert", "book", "pdf", "ebook"].includes(resourceType)) {
+        return 5;
+    }
+
+    return 0;
+}
+
+function getClassLevelAliases(classLevel) {
+    const normalized = normalizeClassLevel(classLevel);
+    if (normalized === "10th") return ["10th", "10"];
+    if (normalized === "12th") return ["12th", "12"];
+    return normalized ? [normalized] : [];
+}
+
+function buildLegacyStoragePrefixes(classLevel, bookConfig = {}) {
+    const classAliases = getClassLevelAliases(classLevel);
+    const subjectStem = inferSubjectLabelFromBookId(bookConfig.id);
+    const rawSubjectValues = [
+        subjectStem,
+        bookConfig.subjectKey,
+        bookConfig.name,
+        bookConfig.titleLabel
+    ].filter(Boolean).map((value) => String(value).trim().toLowerCase().replace(/\s+/g, "-"));
+
+    const prefixes = new Set();
+    classAliases.forEach((alias) => {
+        prefixes.add(`paid-notes/${alias}/`);
+        prefixes.add(`resources/khazana-pdfs/${alias}/`);
+        prefixes.add(`resources/${alias}/`);
+    });
+
+    rawSubjectValues.forEach((value) => {
+        if (!value) return;
+        prefixes.add(`paid-notes/${value}/`);
+        classAliases.forEach((alias) => {
+            prefixes.add(`paid-notes/${alias}/${value}/`);
+            prefixes.add(`resources/khazana-pdfs/${alias}/${value}/`);
+        });
+        prefixes.add(`resources/khazana-pdfs/${value}/`);
+    });
+
+    prefixes.add("paid-notes/");
+    prefixes.add("resources/khazana-pdfs/");
+    prefixes.add("resources/");
+    return Array.from(prefixes);
+}
+
+function pickBestMatchingStoredPdf(files = [], classLevel, bookConfig = {}, subjectCandidates = new Set()) {
+    const classCandidates = new Set(
+        getClassLevelAliases(classLevel).map((value) => normalizeSubjectLookupKey(value)).filter(Boolean)
+    );
+    const bookIdCandidate = normalizeSubjectLookupKey(bookConfig.id);
+
+    const matches = (Array.isArray(files) ? files : [])
+        .map((file) => {
+            const name = String(file?.name || "").trim();
+            const normalizedName = normalizeSubjectLookupKey(name);
+            const updatedAt = getMillis(file?.metadata?.updated || file?.metadata?.timeCreated || 0);
+            if (!name || !/\.pdf$/i.test(name) || !normalizedName) {
+                return null;
+            }
+
+            let score = 0;
+
+            if (bookIdCandidate && normalizedName.includes(bookIdCandidate)) {
+                score += 8;
+            }
+
+            for (const candidate of classCandidates) {
+                if (candidate && normalizedName.includes(candidate)) {
+                    score += 3;
+                    break;
+                }
+            }
+
+            for (const candidate of subjectCandidates) {
+                if (!candidate) continue;
+                if (normalizedName.includes(candidate)) {
+                    score += 5;
+                } else if (candidate.includes(normalizedName) || normalizedName.includes(candidate.slice(0, Math.max(3, candidate.length - 2)))) {
+                    score += 2;
+                }
+            }
+
+            return score > 0
+                ? {
+                    storagePath: name,
+                    fileName: sanitizeDownloadFileName(path.basename(name)),
+                    score,
+                    updatedAt
+                }
+                : null;
+        })
+        .filter(Boolean)
+        .sort((left, right) => {
+            if (right.score !== left.score) return right.score - left.score;
+            return Number(right.updatedAt || 0) - Number(left.updatedAt || 0);
+        });
+
+    return matches[0] ? {
+        storagePath: matches[0].storagePath,
+        fileName: matches[0].fileName
+    } : null;
+}
+
+function buildKhazanaBookResolutionCacheKey(classLevel, bookId) {
+    return `${normalizeClassLevel(classLevel)}::${String(bookId || "").trim()}`;
+}
+
+async function persistKhazanaBookStorageMapping(classLevel, bookId, resolvedBook = {}) {
+    const normalizedClass = normalizeClassLevel(classLevel);
+    const normalizedBookId = String(bookId || "").trim();
+    const storagePath = String(resolvedBook?.storagePath || "").trim();
+    const fileName = String(resolvedBook?.fileName || "").trim();
+
+    if (!normalizedClass || !normalizedBookId || !storagePath) {
+        return;
+    }
+
+    const configRef = firestore.collection("khazana_config").doc("main");
+    await firestore.runTransaction(async (transaction) => {
+        const snapshot = await transaction.get(configRef);
+        if (!snapshot.exists) {
+            return;
+        }
+
+        const config = snapshot.data() || {};
+        const classConfig = config.classes?.[normalizedClass];
+        const books = Array.isArray(classConfig?.books) ? classConfig.books.slice() : [];
+        const index = books.findIndex((book) => String(book?.id || "").trim() === normalizedBookId);
+        if (index < 0) {
+            return;
+        }
+
+        const currentBook = books[index] || {};
+        const currentPath = extractStoragePathFromKhazanaBook(currentBook);
+        const currentFileName = String(currentBook.fileName || "").trim();
+        if (currentPath === storagePath && (!fileName || currentFileName === fileName)) {
+            return;
+        }
+
+        books[index] = {
+            ...currentBook,
+            storagePath,
+            fileName: fileName || currentFileName
+        };
+
+        transaction.set(configRef, {
+            classes: {
+                [normalizedClass]: {
+                    books
+                }
+            }
+        }, { merge: true });
+    });
+}
+
+function readKhazanaBookResolutionCache(classLevel, bookId) {
+    const key = buildKhazanaBookResolutionCacheKey(classLevel, bookId);
+    const entry = bookFileResolutionCache.get(key);
+    if (!entry || typeof entry !== "object") {
+        return null;
+    }
+
+    if (!Number.isFinite(Number(entry.exp)) || Number(entry.exp) <= Date.now()) {
+        bookFileResolutionCache.delete(key);
+        return null;
+    }
+
+    return {
+        storagePath: String(entry.storagePath || "").trim(),
+        fileName: String(entry.fileName || "").trim()
+    };
+}
+
+function writeKhazanaBookResolutionCache(classLevel, bookId, resolvedBook = {}) {
+    const key = buildKhazanaBookResolutionCacheKey(classLevel, bookId);
+    const storagePath = String(resolvedBook?.storagePath || "").trim();
+    if (!key.trim() || !storagePath) {
+        return;
+    }
+
+    bookFileResolutionCache.set(key, {
+        storagePath,
+        fileName: String(resolvedBook?.fileName || "").trim(),
+        exp: Date.now() + BOOK_FILE_RESOLUTION_CACHE_TTL_MS
+    });
+}
+
+function clearKhazanaBookResolutionCache(classLevel, bookId) {
+    const key = buildKhazanaBookResolutionCacheKey(classLevel, bookId);
+    if (!key.trim()) return;
+    bookFileResolutionCache.delete(key);
+}
+
+function clearKhazanaBookResolutionCacheByStoragePath(storagePath) {
+    const normalized = String(storagePath || "").trim();
+    const match = /^paid-notes\/(10th|12th|10|12)\/([^/]+)\//i.exec(normalized);
+    if (!match) {
+        return;
+    }
+
+    const classLevel = normalizeClassLevel(match[1]);
+    const bookId = String(match[2] || "").trim();
+    if (classLevel && bookId) {
+        clearKhazanaBookResolutionCache(classLevel, bookId);
+    }
+}
+
 function firstNonEmptyValue(...values) {
     for (const value of values) {
         const normalized = String(value || "").trim();
@@ -1122,9 +1436,14 @@ function extractStoragePathFromFileUrl(value) {
         return "";
     }
 
+    if (/^gs:\/\//i.test(raw)) {
+        return raw.replace(/^gs:\/\/[^/]+\//i, "").trim();
+    }
+
     try {
         const url = new URL(raw);
-        const objectPath = url.pathname.split("/o/")[1] || "";
+        const objectPath = url.pathname.split("/o/")[1]
+            || String(url.searchParams.get("name") || "").trim();
         if (!objectPath) {
             return "";
         }
