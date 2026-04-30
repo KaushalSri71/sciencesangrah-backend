@@ -794,6 +794,16 @@ async function resolveKhazanaBookFileForUser({ uid, classLevel, bookId }) {
 
     const bookConfig = await getKhazanaBookDefinition(classLevel, bookId);
     if (!bookConfig) {
+        const legacyResource = await resolveLegacyKhazanaResource(classLevel, {
+            id: bookId,
+            name: inferSubjectLabelFromBookId(bookId),
+            titleLabel: inferSubjectLabelFromBookId(bookId),
+            subjectKey: inferSubjectLabelFromBookId(bookId)
+        });
+        if (legacyResource?.storagePath) {
+            return legacyResource;
+        }
+
         const fallbackStoredBook = await resolveStoredKhazanaBookFileByPrefix(classLevel, bookId);
         if (fallbackStoredBook) {
             return fallbackStoredBook;
@@ -882,17 +892,15 @@ function extractStoragePathFromKhazanaBook(book = {}) {
 }
 
 async function resolveLegacyKhazanaResource(classLevel, bookConfig = {}) {
-    const subjectCandidates = new Set([
-        normalizeSubjectLookupKey(bookConfig.subjectKey),
-        normalizeSubjectLookupKey(bookConfig.name),
-        normalizeSubjectLookupKey(bookConfig.titleLabel)
-    ].filter(Boolean));
+    const subjectCandidates = buildKhazanaSubjectCandidates(bookConfig);
 
     if (!subjectCandidates.size) {
         return null;
     }
 
     const snapshot = await firestore.collection("resources").get();
+    const matches = [];
+
     for (const docSnapshot of snapshot.docs) {
         const resource = docSnapshot.data() || {};
         if (String(resource.resourceType || "").trim().toLowerCase() !== "notes") {
@@ -903,8 +911,7 @@ async function resolveLegacyKhazanaResource(classLevel, bookConfig = {}) {
             continue;
         }
 
-        const subjectKey = normalizeSubjectLookupKey(resource.subject);
-        if (!subjectCandidates.has(subjectKey)) {
+        if (!doesResourceMatchKhazanaSubject(resource, subjectCandidates)) {
             continue;
         }
 
@@ -920,13 +927,119 @@ async function resolveLegacyKhazanaResource(classLevel, bookConfig = {}) {
             continue;
         }
 
-        return {
+        matches.push({
             storagePath,
-            fileName: firstNonEmptyValue(resource.fileName, resource.name, resource.title)
+            fileName: firstNonEmptyValue(resource.fileName, resource.name, resource.title),
+            updatedAt: getMillis(resource.updatedAt || resource.updated_at || resource.createdAt || resource.timestamp)
+        });
+    }
+
+    matches.sort((left, right) => Number(right.updatedAt || 0) - Number(left.updatedAt || 0));
+
+    if (matches[0]) {
+        return {
+            storagePath: matches[0].storagePath,
+            fileName: matches[0].fileName
         };
     }
 
     return null;
+}
+
+function buildKhazanaSubjectCandidates(bookConfig = {}) {
+    const rawValues = [
+        bookConfig.subjectKey,
+        bookConfig.name,
+        bookConfig.titleLabel,
+        bookConfig.id,
+        inferSubjectLabelFromBookId(bookConfig.id)
+    ];
+
+    const normalizedValues = new Set(
+        rawValues
+            .map((value) => normalizeSubjectLookupKey(value))
+            .filter(Boolean)
+    );
+
+    const expanded = new Set();
+    normalizedValues.forEach((value) => {
+        expanded.add(value);
+        getSubjectAliases(value).forEach((alias) => expanded.add(alias));
+    });
+
+    return expanded;
+}
+
+function doesResourceMatchKhazanaSubject(resource = {}, subjectCandidates = new Set()) {
+    const directValues = [
+        resource.subject,
+        resource.title,
+        resource.name,
+        resource.fileName,
+        resource.storagePath,
+        resource.filePath,
+        resource.fileUrl,
+        resource.url
+    ];
+
+    const normalizedValues = new Set();
+    directValues.forEach((value) => {
+        const normalized = normalizeSubjectLookupKey(value);
+        if (normalized) {
+            normalizedValues.add(normalized);
+            getSubjectAliases(normalized).forEach((alias) => normalizedValues.add(alias));
+        }
+    });
+
+    for (const candidate of subjectCandidates) {
+        if (!candidate) continue;
+        if (normalizedValues.has(candidate)) {
+            return true;
+        }
+
+        for (const value of normalizedValues) {
+            if (value.includes(candidate) || candidate.includes(value)) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+function inferSubjectLabelFromBookId(bookId) {
+    const raw = String(bookId || "").trim().toLowerCase();
+    if (!raw) {
+        return "";
+    }
+
+    const parts = raw.split("-").filter(Boolean);
+    if (parts.length >= 2) {
+        return parts.slice(1).join(" ");
+    }
+
+    return raw;
+}
+
+function getSubjectAliases(value) {
+    const normalized = normalizeSubjectLookupKey(value);
+    if (!normalized) {
+        return [];
+    }
+
+    const aliasMap = {
+        HINDI: ["HINDI", "HIN"],
+        ENGLISH: ["ENGLISH", "ENG"],
+        MATHS: ["MATHS", "MATH", "MATHEMATICS"],
+        SCIENCE: ["SCIENCE", "SCIE"],
+        SST: ["SST", "SOCIALSCIENCE", "SOCIALSTUDIES", "SOCIAL"],
+        SOCIALSCIENCE: ["SST", "SOCIALSCIENCE", "SOCIALSTUDIES", "SOCIAL"],
+        PHYSICS: ["PHYSICS", "PHY"],
+        CHEMISTRY: ["CHEMISTRY", "CHEM"],
+        BIOLOGY: ["BIOLOGY", "BIO"]
+    };
+
+    return aliasMap[normalized] || [normalized];
 }
 
 function firstNonEmptyValue(...values) {
