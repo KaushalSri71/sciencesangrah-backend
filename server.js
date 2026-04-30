@@ -53,7 +53,14 @@ const app = express();
 let classConfigRefreshPromise = null;
 
 app.use(cors({
-    origin: DEFAULT_ALLOWED_ORIGINS,
+    origin(origin, callback) {
+        if (!origin || isAllowedRequestOrigin(origin)) {
+            callback(null, true);
+            return;
+        }
+
+        callback(null, false);
+    },
     credentials: true
 }));
 app.use(express.json());
@@ -1449,12 +1456,27 @@ function buildPaymentCallbackUrl(classLevel, attemptId, requestOrigin = "", page
         throw new Error("FRONTEND_ORIGIN is required for payment-link callbacks.");
     }
 
-    const baseUrl = resolveFrontendPageBaseUrl(origin, pagePath);
+    const effectivePagePath = resolvePaymentCallbackPagePath(pagePath, requestOrigin, origin);
+    const baseUrl = resolveFrontendPageBaseUrl(origin, effectivePagePath);
     const url = new URL("khazana-payment-status.html", baseUrl);
     url.searchParams.set("class", classLevel);
     url.searchParams.set("attempt", attemptId);
     url.searchParams.set("attemptId", attemptId);
     return url.toString();
+}
+
+function resolvePaymentCallbackPagePath(pagePath = "", requestOrigin = "", resolvedOrigin = "") {
+    const sanitizedPagePath = sanitizeFrontendPagePath(pagePath);
+    if (!sanitizedPagePath) {
+        return "";
+    }
+
+    const requestedOrigin = String(requestOrigin || "").trim().replace(/\/+$/, "");
+    if (!requestedOrigin || requestedOrigin === resolvedOrigin) {
+        return sanitizedPagePath;
+    }
+
+    return stripHostingerPreviewPrefix(sanitizedPagePath);
 }
 
 function resolveFrontendPageBaseUrl(origin, pagePath = "") {
@@ -1495,6 +1517,16 @@ function sanitizeFrontendPagePath(value) {
     } catch (_) {
         return "";
     }
+}
+
+function stripHostingerPreviewPrefix(pathname = "") {
+    const normalizedPath = sanitizeFrontendPagePath(pathname);
+    if (!normalizedPath) {
+        return "";
+    }
+
+    const previewMatch = normalizedPath.match(/\/files\/public_html(\/.*)$/i);
+    return previewMatch ? previewMatch[1] : normalizedPath;
 }
 
 function extractPathnameFromUrl(value) {
