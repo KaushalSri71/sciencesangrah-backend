@@ -99,6 +99,15 @@ function sanitizeFolderSegment(value) {
     return cleaned;
 }
 
+function getSubjectRootRelativePath(relativePath) {
+    const normalizedRelativePath = normalizeRelativePath(relativePath, { allowEmpty: false });
+    const [subjectSegment] = normalizedRelativePath.split("/");
+    if (!subjectSegment) {
+        throw new Error("Subject path is invalid.");
+    }
+    return subjectSegment;
+}
+
 async function ensureLibraryRoot() {
     await fsp.mkdir(LIBRARY_ROOT, { recursive: true });
     return LIBRARY_ROOT;
@@ -647,9 +656,13 @@ async function deleteFile({ classLevel, relativePath }) {
     const normalizedRelativePath = normalizeRelativePath(relativePath, { allowEmpty: false });
     const classRoot = await ensureClassRoot(normalizedClass);
     const absoluteFilePath = await resolveAbsoluteFilePath(normalizedClass, normalizedRelativePath);
+    const subjectRootPath = assertPathInsideRoot(
+        classRoot,
+        path.join(classRoot, getSubjectRootRelativePath(normalizedRelativePath))
+    );
 
     await fsp.unlink(absoluteFilePath);
-    await pruneEmptyDirectories(path.dirname(absoluteFilePath), classRoot);
+    await pruneEmptyDirectories(path.dirname(absoluteFilePath), subjectRootPath);
     invalidateLibraryCaches(normalizedClass);
 
     return {
@@ -673,6 +686,10 @@ async function deleteFolder({ classLevel, folderPath, allowRoot = false }) {
     const normalizedFolderPath = normalizeRelativePath(folderPath, { allowEmpty: false });
     const classRoot = await ensureClassRoot(normalizedClass);
     const absoluteFolderPath = assertPathInsideRoot(classRoot, path.join(classRoot, normalizedFolderPath));
+    const subjectRootPath = assertPathInsideRoot(
+        classRoot,
+        path.join(classRoot, getSubjectRootRelativePath(normalizedFolderPath))
+    );
     const relativeFromClassRoot = path.relative(classRoot, absoluteFolderPath).replace(/\\/g, "/");
 
     if ((!relativeFromClassRoot || !relativeFromClassRoot.includes("/")) && !allowRoot) {
@@ -685,7 +702,7 @@ async function deleteFolder({ classLevel, folderPath, allowRoot = false }) {
     }
 
     await fsp.rm(absoluteFolderPath, { recursive: true, force: false });
-    await pruneEmptyDirectories(path.dirname(absoluteFolderPath), classRoot);
+    await pruneEmptyDirectories(path.dirname(absoluteFolderPath), subjectRootPath);
     invalidateLibraryCaches(normalizedClass);
 
     return {
