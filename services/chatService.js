@@ -8,7 +8,7 @@ const {
 const {
     isClearedPaymentStatus,
     isPendingPaymentStatus
-} = require("../routes/paymentStatus");
+} = require("../utils/paymentStatus");
 
 const DATA_NOT_AVAILABLE = "Data not available";
 const UNCLEAR_QUERY = "Samajh nahi aaya, please thoda clear poochiye";
