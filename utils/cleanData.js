@@ -1,4 +1,4 @@
-const { resolvePaymentState } = require("../routes/paymentStatus")
+const { resolvePaymentState } = require("./paymentStatus");
 
 function normalizeHeader(value) {
     return String(value || "")
