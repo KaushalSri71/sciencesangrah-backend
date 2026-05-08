@@ -106,6 +106,7 @@ app.get("/api/health", async (_req, res) => {
 app.get("/api/khazana/list", async (req, res) => {
     try {
         const requestedClass = normalizeClassLevel(req.query?.classLevel || req.query?.class);
+        res.setHeader("Cache-Control", "public, max-age=60, stale-while-revalidate=300");
         if (requestedClass) {
             const tree = await khazanaLibraryService.getLibraryTree(requestedClass);
             res.json({
@@ -136,6 +137,7 @@ app.get("/api/khazana/library", async (req, res) => {
             return;
         }
 
+        res.setHeader("Cache-Control", "public, max-age=60, stale-while-revalidate=300");
         const tree = await khazanaLibraryService.getLibraryTree(classLevel);
         res.json({
             success: true,
@@ -168,7 +170,7 @@ app.get("/api/khazana/library-cover", async (req, res) => {
         const stats = await fs.promises.stat(absoluteFilePath);
         res.setHeader("Content-Type", khazanaLibraryService.getMimeType(coverRecord.file.name));
         res.setHeader("Content-Length", String(Number(stats.size || 0)));
-        res.setHeader("Cache-Control", "public, max-age=300");
+        res.setHeader("Cache-Control", "public, max-age=86400, stale-while-revalidate=604800");
         fs.createReadStream(absoluteFilePath)
             .on("error", (error) => {
                 if (!res.headersSent) {
