@@ -106,7 +106,7 @@ app.get("/api/health", async (_req, res) => {
 app.get("/api/khazana/list", async (req, res) => {
     try {
         const requestedClass = normalizeClassLevel(req.query?.classLevel || req.query?.class);
-        res.setHeader("Cache-Control", "public, max-age=60, stale-while-revalidate=300");
+        res.setHeader("Cache-Control", "no-store, max-age=0");
         if (requestedClass) {
             const tree = await khazanaLibraryService.getLibraryTree(requestedClass);
             res.json({
@@ -137,7 +137,7 @@ app.get("/api/khazana/library", async (req, res) => {
             return;
         }
 
-        res.setHeader("Cache-Control", "public, max-age=60, stale-while-revalidate=300");
+        res.setHeader("Cache-Control", "no-store, max-age=0");
         const tree = await khazanaLibraryService.getLibraryTree(classLevel);
         res.json({
             success: true,
