@@ -46,7 +46,7 @@ const CLASS_CONFIG = {
     "10th": {
         displayName: "10th Khazana",
         amountInr: 1,
-        bookIds: ["10th-hindi", "10th-english", "10th-maths", "10th-science", "10th-sst"]
+        bookIds: ["10th-hindi", "10th-english", "10th-maths", "10th-sanskrit", "10th-science", "10th-sst"]
     },
     "12th": {
         displayName: "12th Khazana",
@@ -1274,9 +1274,12 @@ async function refreshKhazanaClassConfig() {
                 const fallback = CLASS_CONFIG[normalizedClass];
                 const amountInr = Number(incomingClass.offerPrice ?? incomingClass.amountInr ?? fallback.amountInr);
                 const books = Array.isArray(incomingClass.books) ? incomingClass.books : [];
-                const bookIds = books
-                    .map((book) => String(book?.id || "").trim())
-                    .filter(Boolean);
+                const bookIds = Array.from(new Set([
+                    ...fallback.bookIds,
+                    ...books
+                        .map((book) => String(book?.id || "").trim())
+                        .filter(Boolean)
+                ]));
 
                 CLASS_CONFIG[normalizedClass] = {
                     ...fallback,
@@ -1328,9 +1331,12 @@ async function getFreshKhazanaClassConfigForPayment(classLevel, expectedAmountIn
     }
 
     const books = Array.isArray(incomingClass.books) ? incomingClass.books : [];
-    const bookIds = books
-        .map((book) => String(book?.id || "").trim())
-        .filter(Boolean);
+    const bookIds = Array.from(new Set([
+        ...fallback.bookIds,
+        ...books
+            .map((book) => String(book?.id || "").trim())
+            .filter(Boolean)
+    ]));
 
     CLASS_CONFIG[normalizedClass] = {
         ...fallback,
@@ -2069,6 +2075,8 @@ function getSubjectAliases(value) {
         MATHEMATICS: ["MATHS", "MATH", "MATHEMATICS"],
         SCIENCE: ["SCIENCE", "SCIE"],
         SCIE: ["SCIENCE", "SCIE"],
+        SANSKRIT: ["SANSKRIT", "SANS"],
+        SANS: ["SANSKRIT", "SANS"],
         SST: ["SST", "SOCIALSCIENCE", "SOCIALSTUDIES", "SOCIAL"],
         SOCIALSCIENCE: ["SST", "SOCIALSCIENCE", "SOCIALSTUDIES", "SOCIAL"],
         SOCIALSTUDIES: ["SST", "SOCIALSCIENCE", "SOCIALSTUDIES", "SOCIAL"],
