@@ -1,6 +1,7 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const archiver = require("archiver");
 const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
@@ -9,21 +10,30 @@ const chatRouter = require("./routes/chat");
 const whatsappCompatRouter = require("./routes/whatsappRoutes");
 const whatsappRouter = require("./routes/whatsapp");
 const { initWhatsApp } = require("./services/whatsappService");
-require("dotenv").config({
-    path: require("path").join(__dirname, ".env")
+const khazanaLibraryService = require("./services/khazanaLibraryService");
+const dotenv = require("dotenv");
+
+[
+    path.join(__dirname, "..", "sciencesangrah-backend.env"),
+    path.join(__dirname, ".env"),
+    path.join(__dirname, "..", ".env")
+].forEach((envPath) => {
+    if (fs.existsSync(envPath)) {
+        dotenv.config({ path: envPath });
+    }
 });
-console.log("ENV CHECK → WHATSAPP_ENABLED:", process.env.WHATSAPP_ENABLED);
 
 const DEFAULT_ALLOWED_ORIGINS = [
     "https://sciencesangrah.live",
     "https://www.sciencesangrah.live"
 ];
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8800;
 const FRONTEND_ORIGIN = String(process.env.FRONTEND_ORIGIN || DEFAULT_ALLOWED_ORIGINS[0]).replace(/\/+$/, "");
 const ALLOWED_ORIGINS = String(process.env.ALLOWED_ORIGINS || DEFAULT_ALLOWED_ORIGINS.join(","))
     .split(",")
     .map((value) => value.trim())
     .filter(Boolean);
+const FIREBASE_PROJECT_ID = String(process.env.FIREBASE_PROJECT_ID || "science-sangrah-5067f").trim();
 const FIREBASE_STORAGE_BUCKET = String(process.env.FIREBASE_STORAGE_BUCKET || "").trim();
 const BOOK_ACCESS_TOKEN_SECRET = String(process.env.BOOK_ACCESS_TOKEN_SECRET || "").trim() || crypto.randomBytes(32).toString("hex");
 const BOOK_ACCESS_TOKEN_TTL_MS = 5 * 60 * 1000;
@@ -44,6 +54,9 @@ const CLASS_CONFIG = {
         bookIds: ["12th-hindi", "12th-english", "12th-maths", "12th-physics", "12th-chemistry", "12th-biology"]
     }
 };
+const ADMIN_ROLE_ALLOWLIST = new Set(["admin", "superadmin", "manager", "editor"]);
+const ADMIN_AUTH_CACHE_TTL_MS = 10 * 60 * 1000;
+const adminAuthorizationCache = new Map();
 
 initializeFirebaseAdmin();
 
@@ -53,6 +66,7 @@ const app = express();
 let classConfigRefreshPromise = null;
 const BOOK_FILE_RESOLUTION_CACHE_TTL_MS = 10 * 60 * 1000;
 const bookFileResolutionCache = new Map();
+const KHAZANA_METRICS_DOC_ID = "downloads";
 
 app.use(cors({
     origin(origin, callback) {
@@ -87,6 +101,500 @@ app.get("/api/health", async (_req, res) => {
             ])
         )
     });
+});
+
+app.get("/api/khazana/list", async (req, res) => {
+    try {
+        const requestedClass = normalizeClassLevel(req.query?.classLevel || req.query?.class);
+        if (requestedClass) {
+            const tree = await khazanaLibraryService.getLibraryTree(requestedClass);
+            res.json({
+                success: true,
+                ...tree
+            });
+            return;
+        }
+
+        const tree = await khazanaLibraryService.getAllLibraries();
+        res.json({
+            success: true,
+            ...tree
+        });
+    } catch (error) {
+        console.error("Failed to load Khazana folder structure:", error);
+        res.status(500).json({
+            message: error?.message || "Unable to load the Khazana folders."
+        });
+    }
+});
+
+app.get("/api/khazana/library", async (req, res) => {
+    try {
+        const classLevel = normalizeClassLevel(req.query?.classLevel);
+        if (!classLevel) {
+            res.status(400).json({ message: "Class level is required." });
+            return;
+        }
+
+        const tree = await khazanaLibraryService.getLibraryTree(classLevel);
+        res.json({
+            success: true,
+            ...tree
+        });
+    } catch (error) {
+        console.error("Failed to load Khazana library tree:", error);
+        res.status(500).json({
+            message: error?.message || "Unable to load the Khazana library."
+        });
+    }
+});
+
+app.get("/api/khazana/library-cover", async (req, res) => {
+    try {
+        const classLevel = normalizeClassLevel(req.query?.classLevel);
+        const relativePath = String(req.query?.relativePath || "").trim();
+        if (!classLevel || !relativePath) {
+            res.status(400).json({ message: "Class level and cover path are required." });
+            return;
+        }
+
+        const coverRecord = await khazanaLibraryService.getSubjectCoverRecord(classLevel, relativePath);
+        if (!coverRecord?.file) {
+            res.status(404).json({ message: "Subject cover was not found." });
+            return;
+        }
+
+        const absoluteFilePath = await khazanaLibraryService.resolveAbsoluteFilePath(classLevel, relativePath);
+        const stats = await fs.promises.stat(absoluteFilePath);
+        res.setHeader("Content-Type", khazanaLibraryService.getMimeType(coverRecord.file.name));
+        res.setHeader("Content-Length", String(Number(stats.size || 0)));
+        res.setHeader("Cache-Control", "public, max-age=300");
+        fs.createReadStream(absoluteFilePath)
+            .on("error", (error) => {
+                if (!res.headersSent) {
+                    res.status(500).end("Unable to stream the requested subject cover.");
+                    return;
+                }
+                res.destroy(error);
+            })
+            .pipe(res);
+    } catch (error) {
+        console.error("Failed to stream Khazana subject cover:", error);
+        res.status(500).json({
+            message: error?.message || "Unable to load the requested subject cover."
+        });
+    }
+});
+
+app.post("/api/khazana/upload", verifyFirebaseUser, requireAdminUser, async (req, res) => {
+    try {
+        const formData = await parseMultipartFormData(req);
+        const classLevel = normalizeClassLevel(
+            formData.get("classLevel")
+            || formData.get("class")
+            || formData.get("className")
+        );
+        const subject = String(formData.get("subject") || formData.get("folder") || "").trim();
+        const subfolder = String(formData.get("subfolder") || "").trim();
+        const files = await readFilesFromFormData(formData);
+
+        if (!classLevel) {
+            res.status(400).json({ message: "Class level is required." });
+            return;
+        }
+
+        if (!subject) {
+            res.status(400).json({ message: "Subject is required." });
+            return;
+        }
+
+        if (!files.length) {
+            res.status(400).json({ message: "Choose at least one file to upload." });
+            return;
+        }
+
+        const uploaded = await khazanaLibraryService.uploadFiles({
+            classLevel,
+            subject,
+            subfolder,
+            files
+        });
+
+        res.json({
+            success: true,
+            ...uploaded
+        });
+    } catch (error) {
+        console.error("Failed to upload Khazana files:", error);
+        res.status(500).json({
+            message: error?.message || "Unable to upload the requested files."
+        });
+    }
+});
+
+app.delete("/api/khazana/delete", verifyFirebaseUser, requireAdminUser, async (req, res) => {
+    try {
+        const classLevel = normalizeClassLevel(req.body?.classLevel || req.body?.class || req.query?.classLevel || req.query?.class);
+        const filePath = String(req.body?.filePath || req.body?.relativePath || req.query?.filePath || req.query?.relativePath || "").trim();
+        if (!filePath) {
+            res.status(400).json({ message: "File path is required." });
+            return;
+        }
+
+        const deleted = await khazanaLibraryService.deleteFileByAnyPath(filePath, classLevel);
+        res.json({
+            success: true,
+            ...deleted
+        });
+    } catch (error) {
+        console.error("Failed to delete Khazana file:", error);
+        const statusCode = /does not exist|not found/i.test(String(error?.message || "")) ? 404 : 500;
+        res.status(statusCode).json({
+            message: error?.message || "Unable to delete the requested file."
+        });
+    }
+});
+
+app.get("/api/admin/khazana/library/tree", verifyFirebaseUser, requireAdminUser, async (req, res) => {
+    try {
+        const classLevel = normalizeClassLevel(req.query?.classLevel);
+        if (!classLevel) {
+            res.status(400).json({ message: "Class level is required." });
+            return;
+        }
+
+        const tree = await khazanaLibraryService.getLibraryTree(classLevel);
+        res.json({
+            success: true,
+            ...tree
+        });
+    } catch (error) {
+        console.error("Failed to load admin Khazana library tree:", error);
+        res.status(500).json({
+            message: error?.message || "Unable to load the Khazana library."
+        });
+    }
+});
+
+app.post(
+    "/api/admin/khazana/library/upload",
+    verifyFirebaseUser,
+    requireAdminUser,
+    express.raw({ type: () => true, limit: "110mb" }),
+    async (req, res) => {
+        try {
+            const classLevel = normalizeClassLevel(req.headers["x-class-level"]);
+            const folderPath = decodeHeaderValue(req.headers["x-folder-path"]);
+            const originalFileName = decodeHeaderValue(req.headers["x-file-name"]);
+            const fileBuffer = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+
+            if (!classLevel) {
+                res.status(400).json({ message: "Class level is required." });
+                return;
+            }
+
+            if (!folderPath) {
+                res.status(400).json({ message: "Folder path is required." });
+                return;
+            }
+
+            if (!originalFileName) {
+                res.status(400).json({ message: "File name is required." });
+                return;
+            }
+
+            const uploaded = await khazanaLibraryService.uploadFile({
+                classLevel,
+                folderPath,
+                fileName: originalFileName,
+                fileBuffer
+            });
+
+            res.json({
+                success: true,
+                ...uploaded
+            });
+        } catch (error) {
+            console.error("Failed to upload Khazana library file:", error);
+            res.status(500).json({
+                message: error?.message || "Unable to upload the requested file."
+            });
+        }
+    }
+);
+
+app.post("/api/admin/khazana/library/folder/create", verifyFirebaseUser, requireAdminUser, async (req, res) => {
+    try {
+        const classLevel = normalizeClassLevel(req.body?.classLevel);
+        const folderPath = String(req.body?.folderPath || "").trim();
+        if (!classLevel || !folderPath) {
+            res.status(400).json({ message: "Class level and folder path are required." });
+            return;
+        }
+
+        const created = await khazanaLibraryService.createFolder({
+            classLevel,
+            folderPath
+        });
+
+        res.json({
+            success: true,
+            ...created
+        });
+    } catch (error) {
+        console.error("Failed to create Khazana folder:", error);
+        res.status(500).json({
+            message: error?.message || "Unable to create the requested folder."
+        });
+    }
+});
+
+app.post("/api/admin/khazana/library/folder/rename", verifyFirebaseUser, requireAdminUser, async (req, res) => {
+    try {
+        const classLevel = normalizeClassLevel(req.body?.classLevel);
+        const folderPath = String(req.body?.folderPath || "").trim();
+        const nextName = String(req.body?.nextName || "").trim();
+        const allowRoot = Boolean(req.body?.allowRoot);
+        if (!classLevel || !folderPath || !nextName) {
+            res.status(400).json({ message: "Class level, folder path, and next folder name are required." });
+            return;
+        }
+
+        const renamed = await khazanaLibraryService.renameFolder({
+            classLevel,
+            folderPath,
+            nextName,
+            allowRoot
+        });
+
+        res.json({
+            success: true,
+            ...renamed
+        });
+    } catch (error) {
+        console.error("Failed to rename Khazana folder:", error);
+        const statusCode = /already exists|invalid|does not exist|not found/i.test(String(error?.message || "")) ? 400 : 500;
+        res.status(statusCode).json({
+            message: error?.message || "Unable to rename the requested folder."
+        });
+    }
+});
+
+app.post("/api/admin/khazana/library/delete", verifyFirebaseUser, requireAdminUser, async (req, res) => {
+    try {
+        const classLevel = normalizeClassLevel(req.body?.classLevel);
+        const relativePath = String(req.body?.relativePath || "").trim();
+        if (!classLevel || !relativePath) {
+            res.status(400).json({ message: "Class level and file path are required." });
+            return;
+        }
+
+        const deleted = await khazanaLibraryService.deleteFile({
+            classLevel,
+            relativePath
+        });
+
+        res.json({
+            success: true,
+            ...deleted
+        });
+    } catch (error) {
+        console.error("Failed to delete Khazana library file:", error);
+        const statusCode = /does not exist|not found/i.test(String(error?.message || "")) ? 404 : 500;
+        res.status(statusCode).json({
+            message: error?.message || "Unable to delete the requested file."
+        });
+    }
+});
+
+app.post("/api/admin/khazana/library/file/rename", verifyFirebaseUser, requireAdminUser, async (req, res) => {
+    try {
+        const classLevel = normalizeClassLevel(req.body?.classLevel);
+        const relativePath = String(req.body?.relativePath || "").trim();
+        const nextName = String(req.body?.nextName || "").trim();
+        if (!classLevel || !relativePath || !nextName) {
+            res.status(400).json({ message: "Class level, file path, and next file name are required." });
+            return;
+        }
+
+        const renamed = await khazanaLibraryService.renameFile({
+            classLevel,
+            relativePath,
+            nextName
+        });
+
+        res.json({
+            success: true,
+            ...renamed
+        });
+    } catch (error) {
+        console.error("Failed to rename Khazana library file:", error);
+        const statusCode = /already exists|invalid|does not exist|not found/i.test(String(error?.message || "")) ? 400 : 500;
+        res.status(statusCode).json({
+            message: error?.message || "Unable to rename the requested file."
+        });
+    }
+});
+
+app.post("/api/admin/khazana/library/folder/delete", verifyFirebaseUser, requireAdminUser, async (req, res) => {
+    try {
+        const classLevel = normalizeClassLevel(req.body?.classLevel);
+        const folderPath = String(req.body?.folderPath || "").trim();
+        if (!classLevel || !folderPath) {
+            res.status(400).json({ message: "Class level and folder path are required." });
+            return;
+        }
+
+        const deleted = await khazanaLibraryService.deleteFolder({
+            classLevel,
+            folderPath
+        });
+
+        res.json({
+            success: true,
+            ...deleted
+        });
+    } catch (error) {
+        console.error("Failed to delete Khazana folder:", error);
+        const statusCode = /does not exist|not found/i.test(String(error?.message || "")) ? 404 : 500;
+        res.status(statusCode).json({
+            message: error?.message || "Unable to delete the requested folder."
+        });
+    }
+});
+
+app.post("/api/admin/khazana/library/subject/delete", verifyFirebaseUser, requireAdminUser, async (req, res) => {
+    try {
+        const classLevel = normalizeClassLevel(req.body?.classLevel);
+        const folderPath = String(req.body?.folderPath || "").trim();
+        if (!classLevel || !folderPath) {
+            res.status(400).json({ message: "Class level and subject path are required." });
+            return;
+        }
+
+        const deleted = await khazanaLibraryService.deleteFolder({
+            classLevel,
+            folderPath,
+            allowRoot: true
+        });
+
+        res.json({
+            success: true,
+            ...deleted
+        });
+    } catch (error) {
+        console.error("Failed to delete Khazana subject:", error);
+        const statusCode = /does not exist|not found/i.test(String(error?.message || "")) ? 404 : 500;
+        res.status(statusCode).json({
+            message: error?.message || "Unable to delete the requested subject."
+        });
+    }
+});
+
+app.post("/api/admin/khazana/library/file-link", verifyFirebaseUser, requireAdminUser, async (req, res) => {
+    try {
+        const classLevel = normalizeClassLevel(req.body?.classLevel);
+        const relativePath = String(req.body?.relativePath || "").trim();
+        const requestedDisposition = String(req.body?.disposition || "inline").trim().toLowerCase();
+        const disposition = requestedDisposition === "attachment" ? "attachment" : "inline";
+
+        if (!classLevel || !relativePath) {
+            res.status(400).json({ message: "Class level and file path are required." });
+            return;
+        }
+
+        const fileRecord = await khazanaLibraryService.getFileRecord(classLevel, relativePath);
+        if (!fileRecord?.file) {
+            res.status(404).json({ message: "Requested Khazana file was not found." });
+            return;
+        }
+
+        const token = createLibraryFileAccessToken({
+            classLevel,
+            relativePath: fileRecord.file.relativePath,
+            fileName: fileRecord.file.name
+        });
+
+        res.json({
+            success: true,
+            classLevel,
+            relativePath: fileRecord.file.relativePath,
+            fileName: fileRecord.file.name,
+            isFreePreview: Boolean(fileRecord.file.isFreePreview),
+            url: buildLibraryFileUrl(req, token, disposition)
+        });
+    } catch (error) {
+        console.error("Failed to create admin Khazana library file link:", error);
+        const statusCode = /not found/i.test(String(error?.message || "")) ? 404 : 500;
+        res.status(statusCode).json({
+            message: error?.message || "Unable to prepare the requested admin file link."
+        });
+    }
+});
+
+app.post("/api/khazana/library/file-link", async (req, res) => {
+    try {
+        const classLevel = normalizeClassLevel(req.body?.classLevel);
+        const relativePath = String(req.body?.relativePath || "").trim();
+        const requestedDisposition = String(req.body?.disposition || "inline").trim().toLowerCase();
+        const disposition = requestedDisposition === "attachment" ? "attachment" : "inline";
+
+        if (!classLevel || !relativePath) {
+            res.status(400).json({ message: "Class level and file path are required." });
+            return;
+        }
+
+        const fileRecord = await khazanaLibraryService.getFileRecord(classLevel, relativePath);
+        if (!fileRecord?.file) {
+            res.status(404).json({ message: "Requested Khazana file was not found." });
+            return;
+        }
+
+        const isFreePreview = Boolean(fileRecord.file.isFreePreview);
+        let verifiedUser = null;
+
+        try {
+            verifiedUser = await readVerifiedFirebaseUserFromRequest(req);
+        } catch (_) {
+            verifiedUser = null;
+        }
+
+        if (!isFreePreview) {
+            if (!verifiedUser) {
+                res.status(403).json({ message: "Purchase is required to unlock this file." });
+                return;
+            }
+
+            await refreshKhazanaClassConfig();
+            const accessSummary = await ensureUserAccessForVerifiedUser(verifiedUser);
+            const normalizedAccess = normalizeAccessSummary(accessSummary);
+            if (!hasCompletedClassAccess(normalizedAccess[classLevel])) {
+                res.status(403).json({ message: "Purchase is required to unlock this file." });
+                return;
+            }
+        }
+
+        const token = createLibraryFileAccessToken({
+            classLevel,
+            relativePath: fileRecord.file.relativePath,
+            fileName: fileRecord.file.name
+        });
+
+        res.json({
+            success: true,
+            classLevel,
+            relativePath: fileRecord.file.relativePath,
+            fileName: fileRecord.file.name,
+            isFreePreview,
+            url: buildLibraryFileUrl(req, token, disposition)
+        });
+    } catch (error) {
+        console.error("Failed to create Khazana library file link:", error);
+        const statusCode = /purchase is required/i.test(String(error?.message || "")) ? 403 : 500;
+        res.status(statusCode).json({
+            message: error?.message || "Unable to prepare the requested file."
+        });
+    }
 });
 
 app.post("/api/khazana/access", verifyFirebaseUser, async (req, res) => {
@@ -188,11 +696,52 @@ app.post("/api/khazana/book-access", verifyFirebaseUser, async (req, res) => {
     }
 });
 
+app.post("/api/khazana/class-bundle-access", verifyFirebaseUser, async (req, res) => {
+    try {
+        await refreshKhazanaClassConfig();
+        await ensureUserAccessForVerifiedUser(req.user);
+
+        const classLevel = normalizeClassLevel(req.body?.classLevel);
+        if (!classLevel) {
+            res.status(400).json({ message: "Class bundle payload is incomplete." });
+            return;
+        }
+
+        await assertPurchasedKhazanaClass(req.user.uid, classLevel);
+        const bundleEntries = await buildKhazanaClassBundleEntries(req.user.uid, classLevel);
+        if (!bundleEntries.entries.length) {
+            res.status(404).json({ message: "No PDFs are available yet for this class bundle." });
+            return;
+        }
+
+        const fileName = sanitizeDownloadFileName(`${classLevel} Khazana Notes Bundle.zip`);
+        const token = createClassBundleAccessToken({
+            uid: req.user.uid,
+            classLevel,
+            fileName
+        });
+
+        res.json({
+            success: true,
+            classLevel,
+            fileName,
+            entryCount: bundleEntries.entries.length,
+            url: buildClassBundleUrl(req, token)
+        });
+    } catch (error) {
+        console.error("Failed to create Khazana class bundle link:", error);
+        const statusCode = /purchase|not purchased|not unlocked/i.test(String(error?.message || "")) ? 403 : 500;
+        res.status(statusCode).json({
+            message: error?.message || "Unable to prepare the class bundle."
+        });
+    }
+});
+
 app.post(
     "/api/admin/khazana/book-pdf",
     verifyFirebaseUser,
     requireAdminUser,
-    express.raw({ type: "application/pdf", limit: "55mb" }),
+    express.raw({ type: "application/pdf", limit: "110mb" }),
     async (req, res) => {
         try {
             await refreshKhazanaClassConfig();
@@ -289,6 +838,22 @@ app.post("/api/admin/khazana/storage-file/delete", verifyFirebaseUser, requireAd
     }
 });
 
+app.post("/api/admin/khazana/reconcile-payments", verifyFirebaseUser, requireAdminUser, async (_req, res) => {
+    try {
+        await refreshKhazanaClassConfig();
+        const summary = await reconcilePendingPaidPaymentLinkAttempts({ limit: 50 });
+        res.json({
+            success: true,
+            ...summary
+        });
+    } catch (error) {
+        console.error("Failed to reconcile Khazana payment links:", error);
+        res.status(500).json({
+            message: error?.message || "Unable to reconcile Khazana payment links."
+        });
+    }
+});
+
 app.get("/api/khazana/book-file", async (req, res) => {
     try {
         const token = String(req.query?.token || "").trim();
@@ -306,6 +871,66 @@ app.get("/api/khazana/book-file", async (req, res) => {
             : (/not found|missing/i.test(message) ? 404 : 500);
         console.error("Failed to stream secure Khazana book file:", error);
         res.status(statusCode).send(message || "Unable to stream the requested book file.");
+    }
+});
+
+app.get("/api/khazana/class-bundle", async (req, res) => {
+    try {
+        const token = String(req.query?.token || "").trim();
+        if (!token) {
+            res.status(400).json({ message: "Missing class bundle token." });
+            return;
+        }
+
+        const accessPayload = verifyClassBundleAccessToken(token);
+        await streamKhazanaClassBundle(req, res, accessPayload);
+    } catch (error) {
+        const message = String(error?.message || "");
+        const statusCode = /expired|invalid|tampered|token/i.test(message)
+            ? 401
+            : (/purchase|not found|missing|available/i.test(message) ? 404 : 500);
+        console.error("Failed to stream Khazana class bundle:", error);
+        res.status(statusCode).send(message || "Unable to stream the requested class bundle.");
+    }
+});
+
+app.get("/api/khazana/library-file", async (req, res) => {
+    try {
+        const token = String(req.query?.token || "").trim();
+        if (!token) {
+            res.status(400).json({ message: "Missing library access token." });
+            return;
+        }
+
+        const accessPayload = verifyLibraryFileAccessToken(token);
+        await streamKhazanaLibraryFile(req, res, accessPayload);
+    } catch (error) {
+        const message = String(error?.message || "");
+        const statusCode = /expired|invalid|tampered|token/i.test(message)
+            ? 401
+            : (/not found|missing|does not exist/i.test(message) ? 404 : 500);
+        console.error("Failed to stream Khazana library file:", error);
+        res.status(statusCode).send(message || "Unable to stream the requested file.");
+    }
+});
+
+app.head("/api/khazana/library-file", async (req, res) => {
+    try {
+        const token = String(req.query?.token || "").trim();
+        if (!token) {
+            res.status(400).end();
+            return;
+        }
+
+        const accessPayload = verifyLibraryFileAccessToken(token);
+        await streamKhazanaLibraryFile(req, res, accessPayload, { headOnly: true });
+    } catch (error) {
+        const message = String(error?.message || "");
+        const statusCode = /expired|invalid|tampered|token/i.test(message)
+            ? 401
+            : (/not found|missing|does not exist/i.test(message) ? 404 : 500);
+        console.error("Failed to prepare Khazana library HEAD response:", error);
+        res.status(statusCode).end();
     }
 });
 
@@ -577,12 +1202,14 @@ function initializeFirebaseAdmin() {
     if (admin.apps.length) return;
 
     const storageBucket = resolveFirebaseStorageBucket();
+    const projectId = FIREBASE_PROJECT_ID;
 
     const rawServiceAccount = String(process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "").trim();
     if (rawServiceAccount) {
-        const serviceAccount = JSON.parse(rawServiceAccount);
+        const serviceAccount = parseFirebaseServiceAccount(rawServiceAccount);
         admin.initializeApp({
             credential: admin.credential.cert(serviceAccount),
+            projectId: String(serviceAccount.project_id || projectId).trim() || projectId,
             storageBucket
         });
         return;
@@ -593,6 +1220,7 @@ function initializeFirebaseAdmin() {
         const serviceAccount = JSON.parse(fs.readFileSync(localServiceAccountPath, "utf8"));
         admin.initializeApp({
             credential: admin.credential.cert(serviceAccount),
+            projectId: String(serviceAccount.project_id || projectId).trim() || projectId,
             storageBucket
         });
         console.log(`Firebase Admin initialized with local service account: ${localServiceAccountPath}`);
@@ -601,6 +1229,7 @@ function initializeFirebaseAdmin() {
 
     admin.initializeApp({
         credential: admin.credential.applicationDefault(),
+        projectId,
         storageBucket
     });
     console.warn("Firebase Admin initialized with application default credentials. Set FIREBASE_SERVICE_ACCOUNT_JSON or add backend/serviceAccount.json to guarantee the correct Firebase project.");
@@ -698,14 +1327,7 @@ async function getFreshKhazanaClassConfigForPayment(classLevel, expectedAmountIn
 
 async function verifyFirebaseUser(req, res, next) {
     try {
-        const authHeader = String(req.headers.authorization || "");
-        const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
-        if (!token) {
-            res.status(401).json({ message: "Missing Firebase ID token." });
-            return;
-        }
-
-        req.user = await admin.auth().verifyIdToken(token);
+        req.user = await readVerifiedFirebaseUserFromRequest(req);
         next();
     } catch (error) {
         console.error("Firebase auth verification failed:", error);
@@ -713,22 +1335,198 @@ async function verifyFirebaseUser(req, res, next) {
     }
 }
 
+async function readVerifiedFirebaseUserFromRequest(req) {
+    const authHeader = String(req.headers.authorization || "");
+    const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
+    if (!token) {
+        throw new Error("Missing Firebase ID token.");
+    }
+
+    return admin.auth().verifyIdToken(token);
+}
+
 async function requireAdminUser(req, res, next) {
+    const authUid = resolveVerifiedUserUid(req.user);
+    const authEmail = resolveVerifiedUserEmail(req.user);
+    const tokenRole = normalizeAdminRole(
+        req.user?.role
+        || req.user?.adminRole
+        || (req.user?.admin === true || req.user?.isAdmin === true ? "admin" : "")
+    );
+
+    if (isAllowedAdminRole(tokenRole)) {
+        cacheAdminAuthorization({ uid: authUid, email: authEmail, role: tokenRole });
+        req.adminRole = tokenRole;
+        req.adminRoleSource = "token";
+        next();
+        return;
+    }
+
+    const cachedRole = readCachedAdminAuthorization({ uid: authUid, email: authEmail });
+    if (cachedRole) {
+        req.adminRole = cachedRole;
+        req.adminRoleSource = "cache";
+        next();
+        return;
+    }
+
     try {
-        const adminSnapshot = await firestore.collection("admins").doc(req.user.uid).get();
-        const adminData = adminSnapshot.exists ? adminSnapshot.data() || {} : null;
-        const role = String(adminData?.role || "").trim().toLowerCase();
-        if (!["admin", "superadmin", "manager", "editor"].includes(role)) {
+        let adminData = null;
+
+        if (authUid) {
+            const adminSnapshot = await firestore.collection("admins").doc(authUid).get();
+            if (adminSnapshot.exists) {
+                adminData = adminSnapshot.data() || {};
+            }
+        }
+
+        if (!adminData && authEmail) {
+            const adminQuerySnapshot = await firestore.collection("admins")
+                .where("email", "==", authEmail)
+                .limit(1)
+                .get();
+            if (!adminQuerySnapshot.empty) {
+                adminData = adminQuerySnapshot.docs[0].data() || {};
+            }
+        }
+
+        const role = normalizeAdminRole(adminData?.role);
+        if (!isAllowedAdminRole(role)) {
             res.status(403).json({ message: "Admin access is required for this action." });
             return;
         }
 
+        cacheAdminAuthorization({ uid: authUid, email: authEmail, role });
         req.adminRole = role;
+        req.adminRoleSource = authUid ? "firestore-uid" : "firestore-email";
         next();
     } catch (error) {
         console.error("Admin authorization failed:", error);
+        const localFallbackRole = readLocalDevAdminFallbackRole(req, { uid: authUid, email: authEmail });
+        if (localFallbackRole) {
+            cacheAdminAuthorization({ uid: authUid, email: authEmail, role: localFallbackRole });
+            req.adminRole = localFallbackRole;
+            req.adminRoleSource = "localhost-header";
+            next();
+            return;
+        }
         res.status(500).json({ message: "Unable to verify admin access." });
     }
+}
+
+function normalizeAdminRole(value) {
+    return String(value || "").trim().toLowerCase();
+}
+
+function isAllowedAdminRole(value) {
+    return ADMIN_ROLE_ALLOWLIST.has(normalizeAdminRole(value));
+}
+
+function resolveVerifiedUserUid(user) {
+    return String(user?.uid || user?.user_id || user?.sub || "").trim();
+}
+
+function resolveVerifiedUserEmail(user) {
+    return String(user?.email || "").trim().toLowerCase();
+}
+
+function getAdminAuthorizationCacheKeys({ uid = "", email = "" } = {}) {
+    const keys = [];
+    const normalizedUid = String(uid || "").trim();
+    const normalizedEmail = String(email || "").trim().toLowerCase();
+    if (normalizedUid) {
+        keys.push(`uid:${normalizedUid}`);
+    }
+    if (normalizedEmail) {
+        keys.push(`email:${normalizedEmail}`);
+    }
+    return keys;
+}
+
+function readCachedAdminAuthorization(identity = {}) {
+    const keys = getAdminAuthorizationCacheKeys(identity);
+    const now = Date.now();
+
+    for (const key of keys) {
+        const cached = adminAuthorizationCache.get(key);
+        if (!cached) {
+            continue;
+        }
+
+        if (cached.expiresAt <= now || !isAllowedAdminRole(cached.role)) {
+            adminAuthorizationCache.delete(key);
+            continue;
+        }
+
+        return cached.role;
+    }
+
+    return "";
+}
+
+function cacheAdminAuthorization({ uid = "", email = "", role = "" } = {}) {
+    const normalizedRole = normalizeAdminRole(role);
+    if (!isAllowedAdminRole(normalizedRole)) {
+        return;
+    }
+
+    const entry = {
+        role: normalizedRole,
+        expiresAt: Date.now() + ADMIN_AUTH_CACHE_TTL_MS
+    };
+
+    getAdminAuthorizationCacheKeys({ uid, email }).forEach((key) => {
+        adminAuthorizationCache.set(key, entry);
+    });
+}
+
+function isLoopbackRequest(req) {
+    const hostCandidates = [
+        req.hostname,
+        req.ip,
+        req.socket?.remoteAddress
+    ].map((value) => String(value || "").trim().toLowerCase()).filter(Boolean);
+
+    const loopbackValues = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost"]);
+    if (hostCandidates.some((value) => loopbackValues.has(value))) {
+        return true;
+    }
+
+    const originHeader = String(req.headers.origin || "").trim();
+    if (!originHeader) {
+        return false;
+    }
+
+    try {
+        const originUrl = new URL(originHeader);
+        return loopbackValues.has(String(originUrl.hostname || "").trim().toLowerCase());
+    } catch (_) {
+        return false;
+    }
+}
+
+function readLocalDevAdminFallbackRole(req, identity = {}) {
+    if (!isLoopbackRequest(req)) {
+        return "";
+    }
+
+    const headerRole = normalizeAdminRole(req.headers["x-admin-role"]);
+    if (!isAllowedAdminRole(headerRole)) {
+        return "";
+    }
+
+    const headerUid = String(req.headers["x-admin-uid"] || "").trim();
+    const headerEmail = String(req.headers["x-admin-email"] || "").trim().toLowerCase();
+
+    if (identity.uid && headerUid && identity.uid !== headerUid) {
+        return "";
+    }
+
+    if (identity.email && headerEmail && identity.email !== headerEmail) {
+        return "";
+    }
+
+    return headerRole;
 }
 
 function requireRazorpayCredentials() {
@@ -745,6 +1543,47 @@ function normalizeClassLevel(value) {
     return "";
 }
 
+async function parseMultipartFormData(req) {
+    const contentType = String(req.headers["content-type"] || "").toLowerCase();
+    if (!contentType.includes("multipart/form-data")) {
+        throw new Error("Upload request must use multipart form data.");
+    }
+
+    const request = new Request(`http://localhost${req.originalUrl || req.url || "/"}`, {
+        method: req.method || "POST",
+        headers: req.headers,
+        body: req,
+        duplex: "half"
+    });
+
+    return request.formData();
+}
+
+function isFormDataFile(value) {
+    return Boolean(value)
+        && typeof value === "object"
+        && typeof value.name === "string"
+        && typeof value.arrayBuffer === "function";
+}
+
+async function readFilesFromFormData(formData) {
+    const files = [];
+
+    for (const [, value] of formData.entries()) {
+        if (!isFormDataFile(value)) {
+            continue;
+        }
+
+        files.push({
+            name: String(value.name || "file").trim() || "file",
+            type: String(value.type || "").trim(),
+            buffer: Buffer.from(await value.arrayBuffer())
+        });
+    }
+
+    return files;
+}
+
 function normalizeGatewayMode(value) {
     const raw = String(value || "").trim().toLowerCase();
     return raw === "payment_link" ? "payment_link" : "checkout";
@@ -758,7 +1597,7 @@ function resolveFirebaseStorageBucket() {
     const rawServiceAccount = String(process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "").trim();
     if (rawServiceAccount) {
         try {
-            const parsed = JSON.parse(rawServiceAccount);
+            const parsed = parseFirebaseServiceAccount(rawServiceAccount);
             if (parsed?.project_id) {
                 return `${String(parsed.project_id).trim()}.firebasestorage.app`;
             }
@@ -767,6 +1606,46 @@ function resolveFirebaseStorageBucket() {
     }
 
     return "science-sangrah-5067f.firebasestorage.app";
+}
+
+function parseFirebaseServiceAccount(rawValue) {
+    const raw = String(rawValue || "").trim();
+    if (!raw) {
+        throw new Error("FIREBASE_SERVICE_ACCOUNT_JSON is empty.");
+    }
+
+    const unquoted = (
+        (raw.startsWith('"') && raw.endsWith('"'))
+        || (raw.startsWith("'") && raw.endsWith("'"))
+    )
+        ? raw.slice(1, -1)
+        : raw;
+
+    const candidates = [
+        raw,
+        unquoted,
+        raw.replace(/\\"/g, '"').replace(/\\\r?\n/g, "\\n"),
+        unquoted.replace(/\\"/g, '"').replace(/\\\r?\n/g, "\\n")
+    ];
+
+    for (const candidate of candidates) {
+        try {
+            let parsed = JSON.parse(candidate);
+            if (typeof parsed === "string") {
+                parsed = JSON.parse(parsed);
+            }
+
+            if (parsed && typeof parsed === "object") {
+                if (typeof parsed.private_key === "string") {
+                    parsed.private_key = parsed.private_key.replace(/\r\n/g, "\n").replace(/\\n/g, "\n");
+                }
+                return parsed;
+            }
+        } catch (_) {
+        }
+    }
+
+    throw new Error("FIREBASE_SERVICE_ACCOUNT_JSON could not be parsed. Check the JSON formatting in sciencesangrah-backend.env.");
 }
 
 function createAttemptId() {
@@ -784,7 +1663,7 @@ async function getPurchasedKhazanaClasses(uid) {
 
     const accessSummary = accessSnapshot.data() || {};
     return Object.entries(normalizeAccessSummary(accessSummary))
-        .filter(([, value]) => String(value?.purchase_status || "").trim().toLowerCase() === "completed")
+        .filter(([, value]) => hasCompletedClassAccess(value))
         .map(([classLevel]) => classLevel);
 }
 
@@ -1502,6 +2381,244 @@ function buildKhazanaBookFileName(classLevel, bookConfig = {}) {
     return sanitizeDownloadFileName(`${classLabel} ${titleLabel} Notes.pdf`);
 }
 
+function sanitizeArchiveSegment(value, fallback = "Item") {
+    const normalized = sanitizeDownloadFileName(String(value || "").trim() || fallback);
+    return normalized.replace(/\.+$/g, "").trim() || fallback;
+}
+
+function sanitizeArchiveRelativePath(value, fallbackFileName = "notes.pdf") {
+    const raw = String(value || "").replace(/\\/g, "/");
+    const parts = raw
+        .split("/")
+        .map((segment) => sanitizeArchiveSegment(segment, "Item"))
+        .filter(Boolean);
+
+    if (!parts.length) {
+        return sanitizeArchiveSegment(fallbackFileName, "notes.pdf");
+    }
+
+    return parts.join("/");
+}
+
+function collectKhazanaLibraryFiles(folderNode, target = []) {
+    if (!folderNode || typeof folderNode !== "object") {
+        return target;
+    }
+
+    (folderNode.files || []).forEach((file) => {
+        if (String(file?.extension || "").trim().toLowerCase() === "pdf") {
+            target.push(file);
+        }
+    });
+
+    (folderNode.folders || []).forEach((folder) => {
+        collectKhazanaLibraryFiles(folder, target);
+    });
+
+    return target;
+}
+
+async function getKhazanaClassBookConfigs(classLevel) {
+    const snapshot = await firestore.collection("khazana_config").doc("main").get();
+    if (!snapshot.exists) {
+        return [];
+    }
+
+    const books = snapshot.data()?.classes?.[classLevel]?.books;
+    return Array.isArray(books) ? books.filter((book) => book && typeof book === "object") : [];
+}
+
+function doesKhazanaSubjectMatchBook(subject = {}, bookConfig = {}) {
+    const candidates = buildKhazanaSubjectCandidates(bookConfig);
+    if (!candidates.size) {
+        return false;
+    }
+
+    const subjectKeys = [
+        normalizeSubjectLookupKey(subject.name || ""),
+        normalizeSubjectLookupKey(subject.relativePath || "")
+    ].filter(Boolean);
+
+    return subjectKeys.some((subjectKey) => {
+        for (const candidate of candidates) {
+            if (!candidate) continue;
+            if (subjectKey === candidate || subjectKey.includes(candidate) || candidate.includes(subjectKey)) {
+                return true;
+            }
+        }
+        return false;
+    });
+}
+
+function orderKhazanaBundleSubjects(tree = {}, bookConfigs = []) {
+    const subjects = Array.isArray(tree.subjects) ? tree.subjects.slice() : [];
+    const ordered = [];
+    const usedSubjectPaths = new Set();
+
+    bookConfigs.forEach((bookConfig) => {
+        const matchedSubject = subjects.find((subject) => {
+            const subjectPath = String(subject?.relativePath || "").trim();
+            return subjectPath && !usedSubjectPaths.has(subjectPath) && doesKhazanaSubjectMatchBook(subject, bookConfig);
+        });
+
+        if (!matchedSubject) {
+            return;
+        }
+
+        usedSubjectPaths.add(String(matchedSubject.relativePath || "").trim());
+        ordered.push({
+            subject: matchedSubject,
+            bookConfig
+        });
+    });
+
+    subjects.forEach((subject) => {
+        const subjectPath = String(subject?.relativePath || "").trim();
+        if (!subjectPath || usedSubjectPaths.has(subjectPath)) {
+            return;
+        }
+
+        ordered.push({
+            subject,
+            bookConfig: null
+        });
+    });
+
+    return ordered;
+}
+
+function buildKhazanaBundleRootFolderName(classLevel) {
+    return sanitizeArchiveSegment(`${classLevel} Khazana Notes`, `${classLevel} Khazana Notes`);
+}
+
+function buildKhazanaBundleSubjectFolderName(index, subjectName) {
+    return `${String(index).padStart(2, "0")}_${sanitizeArchiveSegment(subjectName, "Subject")}`;
+}
+
+async function buildKhazanaClassBundleEntries(uid, classLevel) {
+    const normalizedClass = normalizeClassLevel(classLevel);
+    if (!normalizedClass) {
+        throw new Error("Invalid class level.");
+    }
+
+    const tree = await khazanaLibraryService.getLibraryTree(normalizedClass);
+    const bookConfigs = await getKhazanaClassBookConfigs(normalizedClass);
+    const orderedSubjects = orderKhazanaBundleSubjects(tree, bookConfigs);
+    const rootFolderName = buildKhazanaBundleRootFolderName(normalizedClass);
+    const entries = [];
+    let libraryCount = 0;
+    let bookCount = 0;
+    const includedBookIds = new Set();
+
+    for (const [index, item] of orderedSubjects.entries()) {
+        const subject = item.subject || {};
+        const bookConfig = item.bookConfig || null;
+        const subjectFolderName = buildKhazanaBundleSubjectFolderName(index + 1, subject.name || bookConfig?.titleLabel || bookConfig?.name || "Subject");
+        const subjectFiles = collectKhazanaLibraryFiles(subject.tree, []);
+
+        for (const file of subjectFiles) {
+            try {
+                const absolutePath = await khazanaLibraryService.resolveAbsoluteFilePath(normalizedClass, file.relativePath);
+                const normalizedRelativePath = String(file.relativePath || "").replace(/\\/g, "/");
+                const subjectPrefix = `${String(subject.relativePath || "").replace(/\\/g, "/")}/`;
+                const relativeWithinSubject = normalizedRelativePath.startsWith(subjectPrefix)
+                    ? normalizedRelativePath.slice(subjectPrefix.length)
+                    : sanitizeDownloadFileName(file.name || path.basename(normalizedRelativePath));
+
+                entries.push({
+                    type: "library",
+                    classLevel: normalizedClass,
+                    absolutePath,
+                    archivePath: path.posix.join(rootFolderName, subjectFolderName, sanitizeArchiveRelativePath(relativeWithinSubject, file.name || "notes.pdf"))
+                });
+                libraryCount += 1;
+            } catch (error) {
+                console.warn(`Skipping missing Khazana library file ${file?.relativePath || ""} from class bundle:`, error?.message || error);
+            }
+        }
+
+        if (subjectFiles.length > 0) {
+            if (bookConfig?.id) {
+                includedBookIds.add(String(bookConfig.id).trim());
+            }
+            continue;
+        }
+
+        if (!bookConfig?.id) {
+            continue;
+        }
+
+        try {
+            const resolvedBook = await resolveKhazanaBookFileForUser({
+                uid,
+                classLevel: normalizedClass,
+                bookId: String(bookConfig.id || "").trim()
+            });
+
+            if (!resolvedBook?.storagePath) {
+                continue;
+            }
+
+            entries.push({
+                type: "book",
+                classLevel: normalizedClass,
+                storagePath: String(resolvedBook.storagePath || "").trim(),
+                archivePath: path.posix.join(
+                    rootFolderName,
+                    subjectFolderName,
+                    sanitizeArchiveSegment(resolvedBook.fileName || buildKhazanaBookFileName(normalizedClass, bookConfig), buildKhazanaBookFileName(normalizedClass, bookConfig))
+                )
+            });
+            includedBookIds.add(String(bookConfig.id).trim());
+            bookCount += 1;
+        } catch (error) {
+            console.warn(`Skipping Khazana mapped book ${bookConfig?.id || ""} from class bundle:`, error?.message || error);
+        }
+    }
+
+    if (!entries.length) {
+        for (const [index, bookConfig] of bookConfigs.entries()) {
+            const bookId = String(bookConfig?.id || "").trim();
+            if (!bookId || includedBookIds.has(bookId)) {
+                continue;
+            }
+
+            try {
+                const resolvedBook = await resolveKhazanaBookFileForUser({
+                    uid,
+                    classLevel: normalizedClass,
+                    bookId
+                });
+
+                if (!resolvedBook?.storagePath) {
+                    continue;
+                }
+
+                entries.push({
+                    type: "book",
+                    classLevel: normalizedClass,
+                    storagePath: String(resolvedBook.storagePath || "").trim(),
+                    archivePath: path.posix.join(
+                        rootFolderName,
+                        buildKhazanaBundleSubjectFolderName(index + 1, bookConfig.titleLabel || bookConfig.name || bookId),
+                        sanitizeArchiveSegment(resolvedBook.fileName || buildKhazanaBookFileName(normalizedClass, bookConfig), buildKhazanaBookFileName(normalizedClass, bookConfig))
+                    )
+                });
+                bookCount += 1;
+            } catch (error) {
+                console.warn(`Skipping fallback Khazana mapped book ${bookId} from class bundle:`, error?.message || error);
+            }
+        }
+    }
+
+    return {
+        rootFolderName,
+        entries,
+        libraryCount,
+        bookCount
+    };
+}
+
 function sanitizeDownloadFileName(fileName) {
     const normalized = String(fileName || "notes.pdf")
         .trim()
@@ -1572,11 +2689,282 @@ function buildBookFileUrl(req, token, disposition = "inline") {
     return url.toString();
 }
 
+function createClassBundleAccessToken(payload = {}) {
+    const data = {
+        uid: String(payload.uid || "").trim(),
+        classLevel: normalizeClassLevel(payload.classLevel),
+        fileName: sanitizeDownloadFileName(payload.fileName || "Khazana Notes Bundle.zip"),
+        exp: Date.now() + BOOK_ACCESS_TOKEN_TTL_MS
+    };
+
+    const encodedPayload = Buffer.from(JSON.stringify(data)).toString("base64url");
+    const signature = crypto
+        .createHmac("sha256", BOOK_ACCESS_TOKEN_SECRET)
+        .update(encodedPayload)
+        .digest("base64url");
+
+    return `${encodedPayload}.${signature}`;
+}
+
+function verifyClassBundleAccessToken(token) {
+    const [encodedPayload, signature] = String(token || "").split(".");
+    if (!encodedPayload || !signature) {
+        throw new Error("Invalid class bundle token.");
+    }
+
+    const expectedSignature = crypto
+        .createHmac("sha256", BOOK_ACCESS_TOKEN_SECRET)
+        .update(encodedPayload)
+        .digest("base64url");
+
+    const left = Buffer.from(signature);
+    const right = Buffer.from(expectedSignature);
+    if (left.length !== right.length || !crypto.timingSafeEqual(left, right)) {
+        throw new Error("Class bundle token has been tampered with.");
+    }
+
+    const payload = JSON.parse(Buffer.from(encodedPayload, "base64url").toString("utf8"));
+    if (!payload?.uid || !payload?.classLevel) {
+        throw new Error("Class bundle token is incomplete.");
+    }
+
+    if (!Number.isFinite(Number(payload.exp)) || Number(payload.exp) < Date.now()) {
+        throw new Error("Class bundle token has expired.");
+    }
+
+    return payload;
+}
+
+function buildClassBundleUrl(req, token) {
+    const baseUrl = getRequestBaseUrl(req);
+    const url = new URL("/api/khazana/class-bundle", `${baseUrl}/`);
+    url.searchParams.set("token", token);
+    return url.toString();
+}
+
+function createLibraryFileAccessToken(payload = {}) {
+    const data = {
+        classLevel: normalizeClassLevel(payload.classLevel),
+        relativePath: String(payload.relativePath || "").trim(),
+        fileName: String(payload.fileName || "").trim(),
+        exp: Date.now() + BOOK_ACCESS_TOKEN_TTL_MS
+    };
+
+    const encodedPayload = Buffer.from(JSON.stringify(data)).toString("base64url");
+    const signature = crypto
+        .createHmac("sha256", BOOK_ACCESS_TOKEN_SECRET)
+        .update(encodedPayload)
+        .digest("base64url");
+
+    return `${encodedPayload}.${signature}`;
+}
+
+function verifyLibraryFileAccessToken(token) {
+    const [encodedPayload, signature] = String(token || "").split(".");
+    if (!encodedPayload || !signature) {
+        throw new Error("Invalid library access token.");
+    }
+
+    const expectedSignature = crypto
+        .createHmac("sha256", BOOK_ACCESS_TOKEN_SECRET)
+        .update(encodedPayload)
+        .digest("base64url");
+
+    const left = Buffer.from(signature);
+    const right = Buffer.from(expectedSignature);
+    if (left.length !== right.length || !crypto.timingSafeEqual(left, right)) {
+        throw new Error("Library access token has been tampered with.");
+    }
+
+    const payload = JSON.parse(Buffer.from(encodedPayload, "base64url").toString("utf8"));
+    if (!payload?.classLevel || !payload?.relativePath) {
+        throw new Error("Library access token is incomplete.");
+    }
+
+    if (!Number.isFinite(Number(payload.exp)) || Number(payload.exp) < Date.now()) {
+        throw new Error("Library access token has expired.");
+    }
+
+    return payload;
+}
+
+function buildLibraryFileUrl(req, token, disposition = "inline") {
+    const requestedDisposition = String(disposition || "inline").trim().toLowerCase() === "attachment"
+        ? "attachment"
+        : "inline";
+    const baseUrl = getRequestBaseUrl(req);
+    const url = new URL("/api/khazana/library-file", `${baseUrl}/`);
+    url.searchParams.set("token", token);
+    if (requestedDisposition === "attachment") {
+        url.searchParams.set("disposition", "attachment");
+    }
+    return url.toString();
+}
+
 function getRequestBaseUrl(req) {
     const forwardedProto = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim();
     const protocol = forwardedProto || req.protocol || "http";
     const host = String(req.headers["x-forwarded-host"] || req.headers.host || "").split(",")[0].trim();
     return `${protocol}://${host}`;
+}
+
+function recordKhazanaPdfDownload(classLevel, category = "library", count = 1) {
+    const normalizedClass = normalizeClassLevel(classLevel);
+    if (!normalizedClass) {
+        return Promise.resolve();
+    }
+
+    const incrementBy = Math.max(1, Number(count) || 1);
+    const normalizedCategory = String(category || "").trim().toLowerCase() === "book"
+        ? "book"
+        : "library";
+    const metricsRef = firestore.collection("khazana_metrics").doc(KHAZANA_METRICS_DOC_ID);
+
+    return metricsRef.set({
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        "downloads.total": admin.firestore.FieldValue.increment(incrementBy),
+        [`downloads.byClass.${normalizedClass}.total`]: admin.firestore.FieldValue.increment(incrementBy),
+        [`downloads.byClass.${normalizedClass}.${normalizedCategory}`]: admin.firestore.FieldValue.increment(incrementBy)
+    }, { merge: true });
+}
+
+async function streamKhazanaClassBundle(req, res, accessPayload) {
+    const classLevel = normalizeClassLevel(accessPayload.classLevel);
+    const fileName = sanitizeDownloadFileName(accessPayload.fileName || `${classLevel} Khazana Notes Bundle.zip`);
+    const bundle = await buildKhazanaClassBundleEntries(accessPayload.uid, classLevel);
+
+    if (!bundle.entries.length) {
+        throw new Error("No PDFs are available yet for this class bundle.");
+    }
+
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Cache-Control", "private, no-store, max-age=0");
+    res.setHeader("Content-Disposition", `attachment; filename="${fileName}"; filename*=UTF-8''${encodeURIComponent(fileName)}`);
+
+    if (bundle.libraryCount > 0) {
+        void recordKhazanaPdfDownload(classLevel, "library", bundle.libraryCount).catch((error) => {
+            console.warn("Unable to record Khazana library bundle download:", error?.message || error);
+        });
+    }
+
+    if (bundle.bookCount > 0) {
+        void recordKhazanaPdfDownload(classLevel, "book", bundle.bookCount).catch((error) => {
+            console.warn("Unable to record Khazana book bundle download:", error?.message || error);
+        });
+    }
+
+    const archive = archiver("zip", {
+        zlib: { level: 9 }
+    });
+
+    archive.on("warning", (error) => {
+        if (error?.code === "ENOENT") {
+            console.warn("Khazana bundle warning:", error?.message || error);
+            return;
+        }
+        if (!res.headersSent) {
+            res.status(500).end("Unable to prepare the requested class bundle.");
+            return;
+        }
+        res.destroy(error);
+    });
+
+    archive.on("error", (error) => {
+        if (!res.headersSent) {
+            res.status(500).end("Unable to prepare the requested class bundle.");
+            return;
+        }
+        res.destroy(error);
+    });
+
+    archive.pipe(res);
+
+    for (const entry of bundle.entries) {
+        if (entry.type === "library") {
+            archive.file(entry.absolutePath, { name: entry.archivePath });
+            continue;
+        }
+
+        if (entry.type === "book") {
+            const stream = storageBucket.file(entry.storagePath).createReadStream();
+            stream.on("error", (error) => {
+                archive.emit("error", error);
+            });
+            archive.append(stream, { name: entry.archivePath });
+        }
+    }
+
+    await archive.finalize();
+}
+
+async function streamKhazanaLibraryFile(req, res, accessPayload, options = {}) {
+    const headOnly = Boolean(options.headOnly);
+    const absoluteFilePath = await khazanaLibraryService.resolveAbsoluteFilePath(
+        accessPayload.classLevel,
+        accessPayload.relativePath
+    );
+    const stats = await fs.promises.stat(absoluteFilePath);
+    const totalSize = Number(stats.size || 0);
+    const contentType = khazanaLibraryService.getMimeType(accessPayload.fileName || absoluteFilePath);
+    const disposition = String(req.query?.disposition || "").trim().toLowerCase() === "attachment"
+        ? "attachment"
+        : "inline";
+    const fileName = sanitizeDownloadFileName(accessPayload.fileName || path.basename(absoluteFilePath));
+    const contentDisposition = `${disposition}; filename="${fileName}"; filename*=UTF-8''${encodeURIComponent(fileName)}`;
+
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Accept-Ranges", "bytes");
+    res.setHeader("Cache-Control", "private, no-store, max-age=0");
+    res.setHeader("Content-Disposition", contentDisposition);
+
+    const rangeHeader = String(req.headers.range || "").trim();
+    const range = parseHttpRange(rangeHeader, totalSize);
+    const shouldRecordDownload = !headOnly
+        && disposition === "attachment"
+        && (!range || Number(range.start || 0) === 0);
+
+    if (shouldRecordDownload) {
+        void recordKhazanaPdfDownload(accessPayload.classLevel, "library").catch((error) => {
+            console.warn("Unable to record Khazana library PDF download:", error?.message || error);
+        });
+    }
+
+    if (range) {
+        res.status(206);
+        res.setHeader("Content-Range", `bytes ${range.start}-${range.end}/${totalSize}`);
+        res.setHeader("Content-Length", String(range.end - range.start + 1));
+        if (headOnly) {
+            res.end();
+            return;
+        }
+
+        fs.createReadStream(absoluteFilePath, { start: range.start, end: range.end })
+            .on("error", (error) => {
+                if (!res.headersSent) {
+                    res.status(500).end("Unable to stream the requested file range.");
+                    return;
+                }
+                res.destroy(error);
+            })
+            .pipe(res);
+        return;
+    }
+
+    res.setHeader("Content-Length", String(totalSize));
+    if (headOnly) {
+        res.end();
+        return;
+    }
+
+    fs.createReadStream(absoluteFilePath)
+        .on("error", (error) => {
+            if (!res.headersSent) {
+                res.status(500).end("Unable to stream the requested file.");
+                return;
+            }
+            res.destroy(error);
+        })
+        .pipe(res);
 }
 
 async function streamKhazanaBookFile(req, res, accessPayload, options = {}) {
@@ -1608,6 +2996,15 @@ async function streamKhazanaBookFile(req, res, accessPayload, options = {}) {
 
     const rangeHeader = String(req.headers.range || "").trim();
     const range = parseHttpRange(rangeHeader, totalSize);
+    const shouldRecordDownload = !headOnly
+        && disposition === "attachment"
+        && (!range || Number(range.start || 0) === 0);
+
+    if (shouldRecordDownload) {
+        void recordKhazanaPdfDownload(accessPayload.classLevel, "book").catch((error) => {
+            console.warn("Unable to record Khazana book PDF download:", error?.message || error);
+        });
+    }
 
     if (range) {
         res.status(206);
@@ -1717,6 +3114,7 @@ async function ensureUserAccessForVerifiedUser(firebaseUser) {
 
     const email = String(firebaseUser?.email || "").trim();
     const attemptDocs = await findKhazanaAttemptDocsForUser(uid, email);
+    const purchaseDocs = await findKhazanaPurchaseDocsForUser(uid, email);
     const repairedAccess = await reconcilePaidPaymentLinkAttemptsForUser(uid, attemptDocs);
     if (hasCompletedAccess(repairedAccess)) {
         return repairedAccess;
@@ -1730,8 +3128,12 @@ async function ensureUserAccessForVerifiedUser(firebaseUser) {
         const attempt = docSnapshot.data() || {};
         return isCompletedKhazanaAttempt(attempt);
     });
+    const completedPurchases = purchaseDocs.filter((docSnapshot) => {
+        const purchase = docSnapshot.data() || {};
+        return isCompletedKhazanaPurchase(purchase);
+    });
 
-    if (!completedAttempts.length) {
+    if (!completedAttempts.length && !completedPurchases.length) {
         return null;
     }
 
@@ -1758,6 +3160,44 @@ async function ensureUserAccessForVerifiedUser(firebaseUser) {
         };
         });
 
+    completedPurchases.forEach((docSnapshot) => {
+        const purchase = docSnapshot.data() || {};
+        const classLevel = normalizeClassLevel(purchase.class_purchased || purchase.classLevel || purchase.class);
+        const classConfig = CLASS_CONFIG[classLevel];
+        if (!classLevel || !classConfig) return;
+
+        purchasedClasses.add(classLevel);
+        classes[classLevel] = {
+            purchase_id: String(purchase.purchase_id || purchase.purchaseId || docSnapshot.id || classes[classLevel]?.purchase_id || "").trim(),
+            purchase_status: "completed",
+            unlocked_books: Array.isArray(classes[classLevel]?.unlocked_books) && classes[classLevel].unlocked_books.length
+                ? classes[classLevel].unlocked_books
+                : classConfig.bookIds,
+            purchased_at: toIsoString(
+                purchase.timestamp
+                || purchase.updated_at
+                || purchase.updatedAt
+                || purchase.created_at
+                || purchase.createdAt
+            ) || classes[classLevel]?.purchased_at || new Date().toISOString(),
+            amount_paid: Number.isFinite(Number(purchase.amount_paid))
+                ? Number(purchase.amount_paid)
+                : (Number.isFinite(Number(purchase.amountInr)) ? Number(purchase.amountInr) : classConfig.amountInr),
+            razorpay_payment_id: String(
+                purchase.razorpay_payment_id
+                || purchase.paymentId
+                || classes[classLevel]?.razorpay_payment_id
+                || ""
+            ).trim(),
+            razorpay_order_id: String(
+                purchase.razorpay_order_id
+                || purchase.orderId
+                || classes[classLevel]?.razorpay_order_id
+                || ""
+            ).trim()
+        };
+    });
+
     await userAccessRef.set({
         user_id: uid,
         purchased_classes: Array.from(purchasedClasses),
@@ -1771,7 +3211,17 @@ async function ensureUserAccessForVerifiedUser(firebaseUser) {
 
 function hasCompletedAccess(accessSummary) {
     const classes = normalizeAccessSummary(accessSummary);
-    return Object.values(classes).some((value) => String(value?.purchase_status || "").trim().toLowerCase() === "completed");
+    return Object.values(classes).some((value) => hasCompletedClassAccess(value));
+}
+
+function hasCompletedClassAccess(classAccess) {
+    const purchaseStatus = String(classAccess?.purchase_status || "").trim().toLowerCase();
+    if (purchaseStatus === "completed") {
+        return true;
+    }
+
+    const unlockedBooks = Array.isArray(classAccess?.unlocked_books) ? classAccess.unlocked_books.filter(Boolean) : [];
+    return unlockedBooks.length > 0;
 }
 
 function normalizeAccessSummary(accessSummary) {
@@ -1782,9 +3232,12 @@ function normalizeAccessSummary(accessSummary) {
         Object.entries(rawClasses).forEach(([key, value]) => {
             const normalizedKey = normalizeClassLevel(key);
             if (!normalizedKey || !value || typeof value !== "object") return;
+            const unlockedBooks = Array.isArray(value.unlocked_books) ? value.unlocked_books.filter(Boolean) : [];
             normalized[normalizedKey] = {
                 ...(normalized[normalizedKey] || {}),
-                ...value
+                ...value,
+                purchase_status: String(value.purchase_status || normalized[normalizedKey]?.purchase_status || "").trim()
+                    || (unlockedBooks.length ? "completed" : "")
             };
         });
     }
@@ -1804,13 +3257,70 @@ function normalizeAccessSummary(accessSummary) {
 
     const fallbackClass = normalizeClassLevel(accessSummary?.class_purchased);
     if (fallbackClass) {
+        const topLevelUnlockedBooks = Array.isArray(accessSummary?.unlocked_books) ? accessSummary.unlocked_books.filter(Boolean) : [];
         normalized[fallbackClass] = {
             ...(normalized[fallbackClass] || {}),
-            purchase_status: normalized[fallbackClass]?.purchase_status || String(accessSummary?.purchase_status || "completed")
+            purchase_status: normalized[fallbackClass]?.purchase_status
+                || String(accessSummary?.purchase_status || "").trim()
+                || "completed",
+            unlocked_books: Array.isArray(normalized[fallbackClass]?.unlocked_books) && normalized[fallbackClass].unlocked_books.length
+                ? normalized[fallbackClass].unlocked_books
+                : topLevelUnlockedBooks
         };
     }
 
     return normalized;
+}
+
+async function findKhazanaPurchaseDocsForUser(uid, email = "") {
+    const purchasesById = new Map();
+    const normalizedUid = String(uid || "").trim();
+    const normalizedEmail = String(email || "").trim();
+    const queries = [];
+
+    if (normalizedUid) {
+        queries.push(firestore.collection("purchases").where("user_id", "==", normalizedUid).get());
+        queries.push(firestore.collection("purchases").where("uid", "==", normalizedUid).get());
+    }
+
+    if (normalizedEmail) {
+        queries.push(firestore.collection("purchases").where("student.email", "==", normalizedEmail).get());
+    }
+
+    if (!queries.length) {
+        return [];
+    }
+
+    const settled = await Promise.allSettled(queries);
+    settled.forEach((result) => {
+        if (result.status !== "fulfilled") {
+            console.warn("Unable to query Khazana purchases for access repair:", result.reason?.message || result.reason);
+            return;
+        }
+
+        result.value.docs.forEach((docSnapshot) => {
+            purchasesById.set(docSnapshot.id, docSnapshot);
+        });
+    });
+
+    return Array.from(purchasesById.values());
+}
+
+function isCompletedKhazanaPurchase(purchase = {}) {
+    const status = String(purchase.purchase_status || purchase.status || "").trim().toLowerCase();
+    if (["completed", "paid", "success", "captured"].includes(status)) {
+        return true;
+    }
+
+    if (status) {
+        return false;
+    }
+
+    const classLevel = normalizeClassLevel(purchase.class_purchased || purchase.classLevel || purchase.class);
+    return Boolean(
+        classLevel
+        && (purchase.razorpay_payment_id || purchase.paymentId || purchase.payment_attempt_id || Number.isFinite(Number(purchase.amount_paid)))
+    );
 }
 
 async function findKhazanaAttemptDocsForUser(uid, email) {
@@ -1902,6 +3412,76 @@ async function reconcilePaidPaymentLinkAttemptsForUser(uid, attemptDocs) {
     }
 
     return null;
+}
+
+async function reconcilePendingPaidPaymentLinkAttempts({ limit = 50 } = {}) {
+    if (!RAZORPAY_KEY_ID || !RAZORPAY_KEY_SECRET) {
+        return {
+            scanned: 0,
+            reconciled: 0,
+            skipped: 0
+        };
+    }
+
+    const normalizedLimit = Math.max(1, Math.min(200, Number(limit) || 50));
+    const snapshot = await firestore
+        .collection("khazana_payment_attempts")
+        .where("flow", "==", "payment_link")
+        .get();
+
+    const pendingAttempts = snapshot.docs
+        .map((docSnapshot) => ({
+            id: docSnapshot.id,
+            ref: docSnapshot.ref,
+            data: docSnapshot.data() || {}
+        }))
+        .filter(({ data }) => (
+            data.status !== "completed"
+            && data.paymentLinkId
+            && data.uid
+            && CLASS_CONFIG[normalizeClassLevel(data.classLevel)]
+        ))
+        .sort((left, right) => getMillis(right.data.createdAt) - getMillis(left.data.createdAt))
+        .slice(0, normalizedLimit);
+
+    let reconciled = 0;
+    let skipped = 0;
+
+    for (const { id, ref, data: attempt } of pendingAttempts) {
+        try {
+            const classLevel = normalizeClassLevel(attempt.classLevel);
+            const verifiedLinkPayment = await verifyPaymentLinkAttempt({
+                attempt,
+                paymentId: "",
+                paymentLinkId: "",
+                orderId: ""
+            });
+
+            await grantKhazanaAccess({
+                uid: attempt.uid,
+                classLevel,
+                payment: verifiedLinkPayment.payment,
+                paymentId: verifiedLinkPayment.paymentId,
+                orderId: verifiedLinkPayment.orderId,
+                attemptId: id,
+                attemptRef: ref,
+                attempt
+            });
+            reconciled += 1;
+        } catch (error) {
+            const message = String(error?.message || "");
+            if (!/not marked as paid|payment id is not available|lookup failed/i.test(message)) {
+                console.warn(`Unable to reconcile Khazana payment link attempt ${id}:`, error);
+            }
+            skipped += 1;
+        }
+    }
+
+    return {
+        scanned: pendingAttempts.length,
+        reconciled,
+        skipped
+    };
 }
 
 function getMillis(value) {
