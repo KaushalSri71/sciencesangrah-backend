@@ -9,6 +9,12 @@ const CLASS_DIRECTORY_BY_LEVEL = {
 };
 const VALID_CLASS_LEVELS = new Set(Object.keys(CLASS_DIRECTORY_BY_LEVEL));
 const IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "webp", "gif", "avif"]);
+const LIBRARY_TREE_CACHE_TTL_MS = 60 * 1000;
+const libraryTreeCache = new Map();
+let allLibrariesCache = {
+    value: null,
+    exp: 0
+};
 
 function resolveLibraryRoot() {
     const envOverride = String(process.env.KHAZANA_LIBRARY_ROOT || "").trim();
@@ -145,31 +151,40 @@ function createFileRecord({ classLevel, relativePath, parentPath, entryName, sta
 
 async function buildFolderNode(classLevel, absoluteFolderPath, relativeFolderPath) {
     const entries = await getSortedDirectoryEntries(absoluteFolderPath);
-    const folders = [];
-    const files = [];
-
-    for (const entry of entries) {
+    const resolvedEntries = await Promise.all(entries.map(async (entry) => {
         const entryAbsolutePath = path.join(absoluteFolderPath, entry.name);
         const entryRelativePath = relativeFolderPath ? `${relativeFolderPath}/${entry.name}` : entry.name;
 
         if (entry.isDirectory()) {
-            folders.push(await buildFolderNode(classLevel, entryAbsolutePath, entryRelativePath));
-            continue;
+            return {
+                kind: "folder",
+                value: await buildFolderNode(classLevel, entryAbsolutePath, entryRelativePath)
+            };
         }
 
         if (!entry.isFile()) {
-            continue;
+            return null;
         }
 
         const stats = await fsp.stat(entryAbsolutePath);
-        files.push(createFileRecord({
-            classLevel,
-            relativePath: entryRelativePath,
-            parentPath: relativeFolderPath,
-            entryName: entry.name,
-            stats
-        }));
-    }
+        return {
+            kind: "file",
+            value: createFileRecord({
+                classLevel,
+                relativePath: entryRelativePath,
+                parentPath: relativeFolderPath,
+                entryName: entry.name,
+                stats
+            })
+        };
+    }));
+
+    const folders = resolvedEntries
+        .filter((entry) => entry?.kind === "folder" && entry.value)
+        .map((entry) => entry.value);
+    const files = resolvedEntries
+        .filter((entry) => entry?.kind === "file" && entry.value)
+        .map((entry) => entry.value);
 
     return {
         type: "folder",
@@ -335,8 +350,50 @@ function stripClassPrefixFromPath(filePath = "") {
     };
 }
 
+function cloneJson(value) {
+    return JSON.parse(JSON.stringify(value));
+}
+
+function readCachedLibraryTree(classLevel) {
+    const normalizedClass = ensureValidClassLevel(classLevel);
+    const cached = libraryTreeCache.get(normalizedClass);
+    if (!cached || !cached.value || Number(cached.exp || 0) <= Date.now()) {
+        libraryTreeCache.delete(normalizedClass);
+        return null;
+    }
+
+    return cloneJson(cached.value);
+}
+
+function writeCachedLibraryTree(classLevel, tree) {
+    const normalizedClass = ensureValidClassLevel(classLevel);
+    libraryTreeCache.set(normalizedClass, {
+        value: cloneJson(tree),
+        exp: Date.now() + LIBRARY_TREE_CACHE_TTL_MS
+    });
+}
+
+function invalidateLibraryCaches(classLevel = "") {
+    const normalizedClass = normalizeClassLevel(classLevel);
+    if (normalizedClass) {
+        libraryTreeCache.delete(normalizedClass);
+    } else {
+        libraryTreeCache.clear();
+    }
+
+    allLibrariesCache = {
+        value: null,
+        exp: 0
+    };
+}
+
 async function getLibraryTree(classLevel) {
     const normalizedClass = ensureValidClassLevel(classLevel);
+    const cachedTree = readCachedLibraryTree(normalizedClass);
+    if (cachedTree) {
+        return cachedTree;
+    }
+
     const classRoot = await ensureClassRoot(normalizedClass);
     const entries = await getSortedDirectoryEntries(classRoot);
     const subjects = [];
@@ -379,7 +436,7 @@ async function getLibraryTree(classLevel) {
     const totalFileCount = subjects.reduce((sum, subject) => sum + Number(subject.fileCount || 0), 0);
     const freeFileCount = subjects.reduce((sum, subject) => sum + Number(subject.freeFileCount || 0), 0);
 
-    return {
+    const tree = {
         classLevel: normalizedClass,
         classDirectory: getClassDirectoryName(normalizedClass),
         subjects,
@@ -387,17 +444,31 @@ async function getLibraryTree(classLevel) {
         totalFileCount,
         freeFileCount
     };
+
+    writeCachedLibraryTree(normalizedClass, tree);
+    return cloneJson(tree);
 }
 
 async function getAllLibraries() {
+    if (allLibrariesCache.value && Number(allLibrariesCache.exp || 0) > Date.now()) {
+        return cloneJson(allLibrariesCache.value);
+    }
+
     const classes = await Promise.all(
         Object.keys(CLASS_DIRECTORY_BY_LEVEL).map((classLevel) => getLibraryTree(classLevel))
     );
 
-    return {
+    const payload = {
         classes,
         byClass: Object.fromEntries(classes.map((entry) => [entry.classLevel, entry]))
     };
+
+    allLibrariesCache = {
+        value: cloneJson(payload),
+        exp: Date.now() + LIBRARY_TREE_CACHE_TTL_MS
+    };
+
+    return cloneJson(payload);
 }
 
 async function getFileRecord(classLevel, relativePath) {
@@ -484,10 +555,18 @@ async function uploadFile({ classLevel, folderPath, fileName, fileBuffer }) {
     await fsp.mkdir(targetDirectory, { recursive: true });
     const absoluteFilePath = await resolveNonCollidingFilePath(targetDirectory, safeFileName);
     await fsp.writeFile(absoluteFilePath, buffer);
+    invalidateLibraryCaches(normalizedClass);
 
     const savedFileName = path.basename(absoluteFilePath);
     const relativePath = `${normalizedFolderPath}/${savedFileName}`.replace(/\\/g, "/");
-    const fileRecord = await getFileRecord(normalizedClass, relativePath);
+    const stats = await fsp.stat(absoluteFilePath);
+    const fileRecord = createFileRecord({
+        classLevel: normalizedClass,
+        relativePath,
+        parentPath: normalizedFolderPath,
+        entryName: savedFileName,
+        stats
+    });
 
     return {
         classLevel: normalizedClass,
@@ -495,7 +574,7 @@ async function uploadFile({ classLevel, folderPath, fileName, fileBuffer }) {
         folderPath: normalizedFolderPath,
         relativePath,
         fileName: savedFileName,
-        file: fileRecord?.file || null
+        file: fileRecord || null
     };
 }
 
@@ -539,6 +618,7 @@ async function createFolder({ classLevel, folderPath }) {
     const targetDirectory = assertPathInsideRoot(classRoot, path.join(classRoot, normalizedFolderPath));
 
     await fsp.mkdir(targetDirectory, { recursive: true });
+    invalidateLibraryCaches(normalizedClass);
 
     return {
         classLevel: normalizedClass,
@@ -570,6 +650,7 @@ async function deleteFile({ classLevel, relativePath }) {
 
     await fsp.unlink(absoluteFilePath);
     await pruneEmptyDirectories(path.dirname(absoluteFilePath), classRoot);
+    invalidateLibraryCaches(normalizedClass);
 
     return {
         classLevel: normalizedClass,
@@ -605,6 +686,7 @@ async function deleteFolder({ classLevel, folderPath, allowRoot = false }) {
 
     await fsp.rm(absoluteFolderPath, { recursive: true, force: false });
     await pruneEmptyDirectories(path.dirname(absoluteFolderPath), classRoot);
+    invalidateLibraryCaches(normalizedClass);
 
     return {
         classLevel: normalizedClass,
@@ -659,6 +741,7 @@ async function renameFolder({ classLevel, folderPath, nextName, allowRoot = fals
     }
 
     await fsp.rename(absoluteFolderPath, targetAbsolutePath);
+    invalidateLibraryCaches(normalizedClass);
 
     return {
         classLevel: normalizedClass,
@@ -708,7 +791,15 @@ async function renameFile({ classLevel, relativePath, nextName }) {
     }
 
     await fsp.rename(absoluteFilePath, nextAbsolutePath);
-    const fileRecord = await getFileRecord(normalizedClass, nextRelativePath);
+    invalidateLibraryCaches(normalizedClass);
+    const stats = await fsp.stat(nextAbsolutePath);
+    const fileRecord = createFileRecord({
+        classLevel: normalizedClass,
+        relativePath: nextRelativePath,
+        parentPath: currentRelativeDir === "." ? "" : currentRelativeDir,
+        entryName: path.basename(nextAbsolutePath),
+        stats
+    });
 
     return {
         classLevel: normalizedClass,
@@ -716,7 +807,7 @@ async function renameFile({ classLevel, relativePath, nextName }) {
         relativePath: normalizedRelativePath,
         nextRelativePath,
         fileName: nextBaseName,
-        file: fileRecord?.file || null
+        file: fileRecord || null
     };
 }
 
