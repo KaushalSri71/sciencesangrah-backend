@@ -532,6 +532,21 @@ app.post("/api/admin/khazana/library/file-link", verifyFirebaseUser, requireAdmi
     }
 });
 
+app.get("/api/admin/khazana/analytics", verifyFirebaseUser, requireAdminUser, async (_req, res) => {
+    try {
+        const analytics = await buildAdminKhazanaAnalyticsPayload();
+        res.json({
+            success: true,
+            ...analytics
+        });
+    } catch (error) {
+        console.error("Failed to load Khazana analytics:", error);
+        res.status(500).json({
+            message: error?.message || "Unable to load Khazana analytics."
+        });
+    }
+});
+
 app.post("/api/khazana/library/file-link", async (req, res) => {
     try {
         const classLevel = normalizeClassLevel(req.body?.classLevel);
@@ -3481,6 +3496,263 @@ async function reconcilePendingPaidPaymentLinkAttempts({ limit = 50 } = {}) {
         scanned: pendingAttempts.length,
         reconciled,
         skipped
+    };
+}
+
+function readFlattenedNumber(source, pathSegments = []) {
+    const dottedPath = pathSegments.join(".");
+    if (source && Object.prototype.hasOwnProperty.call(source, dottedPath)) {
+        const directValue = Number(source[dottedPath]);
+        return Number.isFinite(directValue) ? directValue : 0;
+    }
+
+    let cursor = source;
+    for (const segment of pathSegments) {
+        if (!cursor || typeof cursor !== "object") {
+            cursor = undefined;
+            break;
+        }
+        cursor = cursor[segment];
+    }
+
+    const nestedValue = Number(cursor);
+    return Number.isFinite(nestedValue) ? nestedValue : 0;
+}
+
+function isCompletedKhazanaPurchaseRecord(purchase = {}) {
+    const status = String(purchase.purchase_status || purchase.status || "").trim().toLowerCase();
+    if (["completed", "paid", "success", "captured"].includes(status)) {
+        return true;
+    }
+
+    if (status) {
+        return false;
+    }
+
+    const classLevel = normalizeClassLevel(purchase.class_purchased || purchase.classLevel || purchase.class);
+    return Boolean(
+        classLevel
+        && (
+            String(purchase.razorpay_payment_id || purchase.paymentId || "").trim()
+            || String(purchase.payment_attempt_id || purchase.paymentAttemptId || "").trim()
+            || Number.isFinite(Number(purchase.amount_paid))
+            || Number.isFinite(Number(purchase.amountInr))
+        )
+    );
+}
+
+function hasCompletedKhazanaClassAccess(classAccess = {}) {
+    const purchaseStatus = String(classAccess.purchase_status || "").trim().toLowerCase();
+    if (["completed", "paid", "success", "captured"].includes(purchaseStatus)) {
+        return true;
+    }
+
+    const unlockedBooks = Array.isArray(classAccess.unlocked_books) ? classAccess.unlocked_books.filter(Boolean) : [];
+    return unlockedBooks.length > 0;
+}
+
+function normalizeKhazanaAccessSummary(accessSummary = {}) {
+    const normalized = {};
+    const rawClasses = accessSummary?.classes;
+
+    if (rawClasses && typeof rawClasses === "object") {
+        Object.entries(rawClasses).forEach(([key, value]) => {
+            const normalizedKey = normalizeClassLevel(key);
+            if (!normalizedKey || !value || typeof value !== "object") return;
+            const unlockedBooks = Array.isArray(value.unlocked_books) ? value.unlocked_books.filter(Boolean) : [];
+            normalized[normalizedKey] = {
+                ...(normalized[normalizedKey] || {}),
+                ...value,
+                purchase_status: String(value.purchase_status || normalized[normalizedKey]?.purchase_status || "").trim()
+                    || (unlockedBooks.length ? "completed" : "")
+            };
+        });
+    }
+
+    const purchasedClasses = Array.isArray(accessSummary?.purchased_classes) ? accessSummary.purchased_classes : [];
+    purchasedClasses.forEach((value) => {
+        const normalizedKey = normalizeClassLevel(value);
+        if (!normalizedKey) return;
+        normalized[normalizedKey] = {
+            ...(normalized[normalizedKey] || {}),
+            purchase_status: normalized[normalizedKey]?.purchase_status || "completed"
+        };
+    });
+
+    const fallbackClass = normalizeClassLevel(accessSummary?.class_purchased);
+    if (fallbackClass) {
+        const topLevelUnlockedBooks = Array.isArray(accessSummary?.unlocked_books) ? accessSummary.unlocked_books.filter(Boolean) : [];
+        normalized[fallbackClass] = {
+            ...(normalized[fallbackClass] || {}),
+            purchase_status: normalized[fallbackClass]?.purchase_status || String(accessSummary?.purchase_status || "completed").trim(),
+            unlocked_books: Array.isArray(normalized[fallbackClass]?.unlocked_books) && normalized[fallbackClass].unlocked_books.length
+                ? normalized[fallbackClass].unlocked_books
+                : topLevelUnlockedBooks
+        };
+    }
+
+    return normalized;
+}
+
+function buildAdminBuyerIdentityKeys(buyer = {}) {
+    const identities = [];
+    const purchaseId = String(buyer.purchase_id || buyer.purchaseId || buyer.id || "").trim();
+    const attemptId = String(buyer.payment_attempt_id || buyer.paymentAttemptId || "").trim();
+    const paymentId = String(buyer.razorpay_payment_id || buyer.paymentId || "").trim();
+    const uid = String(buyer.user_id || buyer.uid || "").trim();
+    const classLevel = normalizeClassLevel(buyer.class_purchased || buyer.classLevel || buyer.class || buyer.buyerClass);
+    const email = String(buyer.buyerEmail || buyer.email || buyer.student?.email || "").trim().toLowerCase();
+
+    if (purchaseId) identities.push(`purchase:${purchaseId}`);
+    if (attemptId) identities.push(`attempt:${attemptId}`);
+    if (paymentId) identities.push(`payment:${paymentId}`);
+    if (uid && classLevel) identities.push(`userclass:${uid}:${classLevel}`);
+    if (email && classLevel) identities.push(`emailclass:${email}:${classLevel}`);
+
+    const fallback = [uid, classLevel, String(buyer.timestamp || buyer.createdAt || buyer.updated_at || "").trim()].filter(Boolean).join("::");
+    if (fallback) identities.push(`fallback:${fallback}`);
+
+    return Array.from(new Set(identities.filter(Boolean)));
+}
+
+function buildSalesSummaryFromBuyers(buyers = []) {
+    const counts = { "10th": 0, "12th": 0 };
+    const revenue = { "10th": 0, "12th": 0 };
+    const byClass = { "10th": [], "12th": [] };
+
+    buyers.forEach((buyer) => {
+        const classLevel = normalizeClassLevel(buyer.class_purchased || buyer.classLevel || buyer.class || buyer.buyerClass);
+        if (!classLevel || !(classLevel in counts)) {
+            return;
+        }
+
+        counts[classLevel] += 1;
+        revenue[classLevel] += Number.isFinite(Number(buyer.amount_paid)) ? Number(buyer.amount_paid) : 0;
+        byClass[classLevel].push(buyer);
+    });
+
+    return {
+        counts,
+        revenue,
+        totalSold: buyers.length,
+        totalRevenue: buyers.reduce((sum, buyer) => sum + (Number.isFinite(Number(buyer.amount_paid)) ? Number(buyer.amount_paid) : 0), 0),
+        byClass
+    };
+}
+
+async function buildAdminKhazanaAnalyticsPayload() {
+    const [configSnapshot, metricsSnapshot, purchasesSnapshot, attemptsSnapshot, accessSnapshot] = await Promise.all([
+        firestore.collection("khazana_config").doc("main").get(),
+        firestore.collection("khazana_metrics").doc("downloads").get(),
+        firestore.collection("purchases").get(),
+        firestore.collection("khazana_payment_attempts").where("status", "==", "completed").get(),
+        firestore.collection("user_access").get()
+    ]);
+
+    const config = configSnapshot.exists ? (configSnapshot.data() || {}) : {};
+    const metricsData = metricsSnapshot.exists ? (metricsSnapshot.data() || {}) : {};
+    const downloads = {
+        total: readFlattenedNumber(metricsData, ["downloads", "total"]),
+        byClass: {
+            "10th": {
+                total: readFlattenedNumber(metricsData, ["downloads", "byClass", "10th", "total"]),
+                library: readFlattenedNumber(metricsData, ["downloads", "byClass", "10th", "library"]),
+                book: readFlattenedNumber(metricsData, ["downloads", "byClass", "10th", "book"])
+            },
+            "12th": {
+                total: readFlattenedNumber(metricsData, ["downloads", "byClass", "12th", "total"]),
+                library: readFlattenedNumber(metricsData, ["downloads", "byClass", "12th", "library"]),
+                book: readFlattenedNumber(metricsData, ["downloads", "byClass", "12th", "book"])
+            }
+        }
+    };
+
+    const buyers = [];
+    const seen = new Set();
+    const addBuyer = (buyer) => {
+        const identities = buildAdminBuyerIdentityKeys(buyer);
+        if (!identities.length || identities.some((identity) => seen.has(identity))) {
+            return;
+        }
+
+        identities.forEach((identity) => seen.add(identity));
+        buyers.push(buyer);
+    };
+
+    purchasesSnapshot.docs
+        .map((docSnapshot) => ({ id: docSnapshot.id, ...docSnapshot.data() }))
+        .filter((purchase) => isCompletedKhazanaPurchaseRecord(purchase))
+        .forEach((purchase) => addBuyer({
+            source: "purchase",
+            ...purchase
+        }));
+
+    attemptsSnapshot.docs
+        .map((docSnapshot) => ({ id: docSnapshot.id, ...docSnapshot.data() }))
+        .forEach((attempt) => addBuyer({
+            source: "attempt",
+            id: String(attempt.purchaseId || attempt.id || "").trim(),
+            uid: String(attempt.uid || attempt.user_id || "").trim(),
+            user_id: String(attempt.uid || attempt.user_id || "").trim(),
+            class_purchased: normalizeClassLevel(attempt.classLevel || attempt.class_purchased || attempt.class),
+            purchase_status: "completed",
+            amount_paid: Number.isFinite(Number(attempt.amountInr)) ? Number(attempt.amountInr) : 0,
+            razorpay_payment_id: String(attempt.paymentId || attempt.razorpay_payment_id || "").trim(),
+            razorpay_order_id: String(attempt.orderId || attempt.razorpay_order_id || "").trim(),
+            payment_attempt_id: String(attempt.payment_attempt_id || attempt.paymentAttemptId || attempt.id || "").trim(),
+            student: attempt.student || {},
+            timestamp: attempt.verifiedAt || attempt.updatedAt || attempt.createdAt || null,
+            createdAt: attempt.createdAt || null,
+            updated_at: attempt.updatedAt || null
+        }));
+
+    accessSnapshot.docs.forEach((docSnapshot) => {
+        const accessSummary = docSnapshot.data() || {};
+        const classes = normalizeKhazanaAccessSummary(accessSummary);
+
+        Object.entries(classes).forEach(([classLevel, classAccess]) => {
+            if (!hasCompletedKhazanaClassAccess(classAccess)) {
+                return;
+            }
+
+            addBuyer({
+                source: "access",
+                id: `access:${docSnapshot.id}:${classLevel}`,
+                uid: String(accessSummary.user_id || docSnapshot.id || "").trim(),
+                user_id: String(accessSummary.user_id || docSnapshot.id || "").trim(),
+                class_purchased: classLevel,
+                purchase_status: "completed",
+                amount_paid: Number.isFinite(Number(classAccess.amount_paid)) ? Number(classAccess.amount_paid) : (Number.isFinite(Number(classAccess.amountInr)) ? Number(classAccess.amountInr) : 0),
+                razorpay_payment_id: String(classAccess.razorpay_payment_id || classAccess.paymentId || "").trim(),
+                razorpay_order_id: String(classAccess.razorpay_order_id || classAccess.orderId || "").trim(),
+                purchase_id: String(classAccess.purchase_id || classAccess.purchaseId || "").trim(),
+                student: accessSummary.student || {},
+                timestamp: classAccess.purchased_at || accessSummary.updated_at || accessSummary.timestamp || null,
+                createdAt: accessSummary.createdAt || null,
+                updated_at: accessSummary.updated_at || null
+            });
+        });
+    });
+
+    return {
+        config,
+        buyers,
+        sales: buildSalesSummaryFromBuyers(buyers),
+        downloads,
+        backend: {
+            ok: true,
+            service: "khazana-razorpay-backend",
+            flow: DEFAULT_RAZORPAY_FLOW,
+            classes: Object.fromEntries(
+                Object.entries(CLASS_CONFIG).map(([classLevel, configEntry]) => [
+                    classLevel,
+                    {
+                        displayName: configEntry.displayName,
+                        amountInr: configEntry.amountInr
+                    }
+                ])
+            )
+        }
     };
 }
 
