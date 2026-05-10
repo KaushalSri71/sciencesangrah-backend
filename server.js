@@ -126,6 +126,8 @@ app.post("/api/users/profile", verifyFirebaseUser, async (req, res) => {
         const name = String(req.body?.name || req.body?.fullName || req.user?.name || req.user?.displayName || "").trim()
             || (email ? email.split("@")[0] : "Student");
         const mobile = String(req.body?.mobile || req.body?.phone || "").replace(/\D+/g, "").slice(-10);
+        const district = String(req.body?.district || req.body?.city || "").trim();
+        const classLevel = String(req.body?.classLevel || req.body?.class || "").trim();
         const userRef = firestore.collection("users").doc(uid);
         const userSnapshot = await userRef.get();
         const existingProfile = userSnapshot.exists ? userSnapshot.data() || {} : {};
@@ -136,6 +138,11 @@ app.post("/api/users/profile", verifyFirebaseUser, async (req, res) => {
             email,
             mobile,
             phone: mobile,
+            district: district || existingProfile.district || existingProfile.city || "",
+            city: district || existingProfile.city || existingProfile.district || "",
+            location: district || existingProfile.location || existingProfile.city || existingProfile.district || "",
+            class: classLevel || existingProfile.class || existingProfile.classLevel || "",
+            classLevel: classLevel || existingProfile.classLevel || existingProfile.class || "",
             role: existingProfile.role || "student",
             status: existingProfile.status || "active",
             source: existingProfile.source || "website",
@@ -156,7 +163,9 @@ app.post("/api/users/profile", verifyFirebaseUser, async (req, res) => {
                 uid,
                 name,
                 email,
-                mobile
+                mobile,
+                district: payload.district,
+                classLevel: payload.classLevel
             }
         });
     } catch (error) {
