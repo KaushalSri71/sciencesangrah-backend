@@ -17,11 +17,147 @@ const QUIZ_DATA_PATH = path.join(__dirname, "..", "..", "live-event", "firebase"
 module.exports = function createLiveEventRouter({ admin, projectId, databaseUrl }) {
     const router = express.Router();
     const realtimeDb = admin.database();
+    const firestore = admin.firestore();
     const resolvedProjectId = String(projectId || PUBLIC_FIREBASE_CONFIG.projectId).trim() || PUBLIC_FIREBASE_CONFIG.projectId;
     const resolvedDatabaseUrl = String(databaseUrl || `https://${resolvedProjectId}-default-rtdb.firebaseio.com`).trim();
+    const TEST_MODE_ALLOWED_ROLES = new Set(["admin", "superadmin", "manager", "editor", "mentor"]);
+    const LIVE_EVENT_SESSION_PATH = ["liveEvent", "session", "current", "state"];
 
-    router.get("/bootstrap", async (_req, res) => {
+    function normalizeRole(value) {
+        return String(value || "").trim().toLowerCase();
+    }
+
+    function isTestModeAllowedRole(role) {
+        return TEST_MODE_ALLOWED_ROLES.has(normalizeRole(role));
+    }
+
+    async function getLiveEventSessionState() {
+        const snapshot = await firestore
+            .collection(LIVE_EVENT_SESSION_PATH[0])
+            .doc(LIVE_EVENT_SESSION_PATH[1])
+            .collection(LIVE_EVENT_SESSION_PATH[2])
+            .doc(LIVE_EVENT_SESSION_PATH[3])
+            .get();
+        return snapshot.exists ? (snapshot.data() || {}) : {};
+    }
+
+    async function readVerifiedFirebaseUserFromRequest(req) {
+        const authHeader = String(req.headers.authorization || "");
+        const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
+        if (!token) return null;
+        return admin.auth().verifyIdToken(token);
+    }
+
+    async function resolveRoleFromIdentity(identity = {}) {
+        const uid = String(identity.uid || identity.user_id || identity.sub || "").trim();
+        const email = String(identity.email || "").trim().toLowerCase();
+
+        if (uid) {
+            const adminSnapshot = await firestore.collection("admins").doc(uid).get();
+            if (adminSnapshot.exists) {
+                const adminData = adminSnapshot.data() || {};
+                const adminRole = normalizeRole(adminData.role || "admin");
+                if (adminRole) {
+                    return {
+                        uid,
+                        email,
+                        role: adminRole,
+                        isAuthenticated: true
+                    };
+                }
+            }
+        }
+
+        if (email) {
+            const adminQuery = await firestore.collection("admins").where("email", "==", email).limit(1).get();
+            if (!adminQuery.empty) {
+                const adminData = adminQuery.docs[0].data() || {};
+                const adminRole = normalizeRole(adminData.role || "admin");
+                if (adminRole) {
+                    return {
+                        uid: uid || String(adminData.uid || adminQuery.docs[0].id || "").trim(),
+                        email,
+                        role: adminRole,
+                        isAuthenticated: true
+                    };
+                }
+            }
+        }
+
+        if (uid) {
+            const userSnapshot = await firestore.collection("users").doc(uid).get();
+            if (userSnapshot.exists) {
+                const userData = userSnapshot.data() || {};
+                return {
+                    uid,
+                    email: email || String(userData.email || "").trim().toLowerCase(),
+                    role: normalizeRole(userData.role || "student") || "student",
+                    isAuthenticated: true
+                };
+            }
+        }
+
+        return {
+            uid,
+            email,
+            role: uid || email ? "student" : "guest",
+            isAuthenticated: Boolean(uid || email)
+        };
+    }
+
+    async function resolveAccessState(req, options = {}) {
+        const participantId = sanitizeParticipantId(options.participantId || req.body?.participantId || req.query?.participantId);
+        const verifiedUser = await readVerifiedFirebaseUserFromRequest(req).catch(() => null);
+        const identity = verifiedUser || (participantId ? { uid: participantId } : {});
+        const resolvedIdentity = await resolveRoleFromIdentity(identity);
+        const sessionState = await getLiveEventSessionState();
+        const testMode = Boolean(sessionState.testMode);
+        const allowed = !testMode || isTestModeAllowedRole(resolvedIdentity.role);
+
+        return {
+            ...resolvedIdentity,
+            testMode,
+            allowed,
+            message: allowed
+                ? ""
+                : "Live Event test mode is active. Only admins and mentors can access the event right now."
+        };
+    }
+
+    router.get("/access", async (req, res) => {
         try {
+            const accessState = await resolveAccessState(req);
+            res.setHeader("Cache-Control", "no-store, max-age=0");
+            res.json({
+                ok: true,
+                testMode: accessState.testMode,
+                allowed: accessState.allowed,
+                role: accessState.role,
+                authenticated: accessState.isAuthenticated,
+                message: accessState.message
+            });
+        } catch (error) {
+            console.error("Failed to resolve live event access:", error);
+            res.status(500).json({
+                message: error?.message || "Unable to verify live event access."
+            });
+        }
+    });
+
+    router.get("/bootstrap", async (req, res) => {
+        try {
+            const accessState = await resolveAccessState(req);
+            if (!accessState.allowed) {
+                res.status(403).json({
+                    ok: false,
+                    testMode: true,
+                    allowed: false,
+                    role: accessState.role,
+                    message: accessState.message
+                });
+                return;
+            }
+
             const assets = loadEventAssets();
             const runtime = await ensureRuntime(realtimeDb, assets.config);
 
@@ -85,6 +221,7 @@ module.exports = function createLiveEventRouter({ admin, projectId, databaseUrl 
             const participantName = sanitizeParticipantName(req.body?.participantName);
             const questionIndex = Number(req.body?.questionIndex);
             const option = String(req.body?.option || "").trim().toUpperCase();
+            const accessState = await resolveAccessState(req, { participantId });
 
             if (eventId !== assets.config.eventId) {
                 res.status(400).json({ message: "Unknown live event." });
@@ -103,6 +240,11 @@ module.exports = function createLiveEventRouter({ admin, projectId, databaseUrl 
 
             if (!["A", "B", "C", "D"].includes(option)) {
                 res.status(400).json({ message: "Vote option is invalid." });
+                return;
+            }
+
+            if (!accessState.allowed) {
+                res.status(403).json({ message: accessState.message });
                 return;
             }
 
