@@ -114,6 +114,65 @@ app.get("/api/health", async (_req, res) => {
     });
 });
 
+app.post("/api/users/check-duplicate", async (req, res) => {
+    try {
+        const email = String(req.body?.email || "").trim().toLowerCase();
+        const mobile = String(req.body?.mobile || req.body?.phone || "").replace(/\D+/g, "").slice(-10);
+
+        if (!email && !mobile) {
+            res.json({
+                ok: true,
+                duplicate: false,
+                duplicateBy: ""
+            });
+            return;
+        }
+
+        const checks = [];
+        if (email) {
+            checks.push(
+                firestore.collection("users").where("email", "==", email).limit(1).get()
+            );
+        }
+        if (mobile) {
+            checks.push(
+                firestore.collection("users").where("mobile", "==", mobile).limit(1).get(),
+                firestore.collection("users").where("phone", "==", mobile).limit(1).get()
+            );
+        }
+
+        const snapshots = await Promise.all(checks);
+        const hasEmailDuplicate = Boolean(email) && snapshots.some((snapshot) => (
+            !snapshot.empty
+            && snapshot.docs.some((docSnapshot) => {
+                const data = docSnapshot.data() || {};
+                return String(data.email || "").trim().toLowerCase() === email;
+            })
+        ));
+        const hasMobileDuplicate = Boolean(mobile) && snapshots.some((snapshot) => (
+            !snapshot.empty
+            && snapshot.docs.some((docSnapshot) => {
+                const data = docSnapshot.data() || {};
+                const normalizedMobile = String(data.mobile || data.phone || "").replace(/\D+/g, "").slice(-10);
+                return normalizedMobile === mobile;
+            })
+        ));
+
+        res.json({
+            ok: true,
+            duplicate: hasEmailDuplicate || hasMobileDuplicate,
+            duplicateBy: hasEmailDuplicate ? "email" : (hasMobileDuplicate ? "mobile" : "")
+        });
+    } catch (error) {
+        console.error("Failed to validate duplicate signup:", {
+            code: error?.code || "",
+            message: error?.message || "",
+            error
+        });
+        res.status(500).json({ message: "Unable to validate duplicate registration." });
+    }
+});
+
 app.post("/api/users/profile", verifyFirebaseUser, async (req, res) => {
     try {
         const uid = resolveVerifiedUserUid(req.user);
