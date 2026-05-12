@@ -13,6 +13,8 @@ const PUBLIC_FIREBASE_CONFIG = {
 
 const EVENT_CONFIG_PATH = path.join(__dirname, "..", "..", "live-event", "firebase", "event-config.json");
 const QUIZ_DATA_PATH = path.join(__dirname, "..", "..", "live-event", "firebase", "quiz-data.json");
+let cachedEventAssets = null;
+let cachedEventAssetsSignature = "";
 
 module.exports = function createLiveEventRouter({ admin, projectId, databaseUrl }) {
     const router = express.Router();
@@ -339,6 +341,19 @@ function buildRuntimePath(eventId) {
 }
 
 function loadEventAssets() {
+    const configStats = fs.statSync(EVENT_CONFIG_PATH);
+    const questionStats = fs.statSync(QUIZ_DATA_PATH);
+    const nextSignature = [
+        configStats.mtimeMs,
+        configStats.size,
+        questionStats.mtimeMs,
+        questionStats.size
+    ].join(":");
+
+    if (cachedEventAssets && cachedEventAssetsSignature === nextSignature) {
+        return cachedEventAssets;
+    }
+
     const config = JSON.parse(fs.readFileSync(EVENT_CONFIG_PATH, "utf8"));
     const questions = JSON.parse(fs.readFileSync(QUIZ_DATA_PATH, "utf8"));
 
@@ -346,7 +361,9 @@ function loadEventAssets() {
         throw new Error("Live event configuration is incomplete.");
     }
 
-    return { config, questions };
+    cachedEventAssets = { config, questions };
+    cachedEventAssetsSignature = nextSignature;
+    return cachedEventAssets;
 }
 
 async function ensureRuntime(realtimeDb, config) {
