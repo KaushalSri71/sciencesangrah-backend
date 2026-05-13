@@ -149,6 +149,7 @@ module.exports = function createLiveEventRouter({ admin, projectId, databaseUrl 
     router.get("/bootstrap", async (req, res) => {
         try {
             const accessState = await resolveAccessState(req);
+            res.setHeader("Cache-Control", "no-store, max-age=0");
             if (!accessState.allowed) {
                 res.status(403).json({
                     ok: false,
@@ -163,7 +164,6 @@ module.exports = function createLiveEventRouter({ admin, projectId, databaseUrl 
             const assets = loadEventAssets();
             const runtime = await ensureRuntime(realtimeDb, assets.config);
 
-            res.setHeader("Cache-Control", "no-store, max-age=0");
             res.json({
                 ok: true,
                 config: assets.config,
