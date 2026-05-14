@@ -1,0 +1,44 @@
+[
+  {
+    "key": "q1",
+    "number": 1,
+    "subject": "Physics",
+    "text": "If a spaceship travels at 90% the speed of light relative to Earth, how will time pass for the astronauts compared to people on Earth?",
+    "options": {
+      "A": "Time passes faster for astronauts",
+      "B": "Time passes slower for astronauts",
+      "C": "Time passes at the exact same rate",
+      "D": "Time stops completely for astronauts"
+    },
+    "correct": "B",
+    "explanation": "According to Einstein's theory of Special Relativity, time dilation occurs at relativistic speeds. Time moves slower for the moving observer relative to a stationary observer."
+  },
+  {
+    "key": "q2",
+    "number": 2,
+    "subject": "Chemistry",
+    "text": "Which of the following elements exhibits the highest electronegativity?",
+    "options": {
+      "A": "Oxygen",
+      "B": "Chlorine",
+      "C": "Fluorine",
+      "D": "Nitrogen"
+    },
+    "correct": "C",
+    "explanation": "Fluorine is the most electronegative element on the periodic table, with a value of 3.98 on the Pauling scale, making it highly reactive."
+  },
+  {
+    "key": "q3",
+    "number": 3,
+    "subject": "Biology",
+    "text": "What is the primary function of mitochondria in an animal cell?",
+    "options": {
+      "A": "Protein synthesis",
+      "B": "Cellular respiration",
+      "C": "Photosynthesis",
+      "D": "DNA replication"
+    },
+    "correct": "B",
+    "explanation": "Mitochondria are often called the powerhouses of the cell because they generate most of the cell's adenosine triphosphate through cellular respiration."
+  }
+]
