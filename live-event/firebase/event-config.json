@@ -1,0 +1,14 @@
+{
+  "eventId": "science-sangrah-live-quiz",
+  "eventLabel": "One-day live event",
+  "youtubeVideoId": "jfKfPfyJRdk",
+  "answerTimeSec": 60,
+  "lockTimeSec": 3,
+  "explainTimeSec": 60,
+  "voteShardCount": 16,
+  "engagementSeed": 1729,
+  "targets": {
+    "likes": 2500,
+    "viewers": 23200
+  }
+}
