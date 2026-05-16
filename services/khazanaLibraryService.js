@@ -20,6 +20,8 @@ function resolveLibraryRoot() {
     const envOverride = String(process.env.KHAZANA_LIBRARY_ROOT || "").trim();
     const candidates = [
         envOverride,
+        path.resolve(process.cwd(), "data", "khazana"),
+        path.resolve(process.cwd(), "..", "data", "khazana"),
         path.resolve(__dirname, "..", "..", "data", "khazana"),
         path.resolve(__dirname, "..", "data", "khazana")
     ].filter(Boolean);
@@ -34,6 +36,62 @@ function resolveLibraryRoot() {
     }
 
     return candidates[0] || path.resolve(__dirname, "..", "..", "data", "khazana");
+}
+
+function normalizeSortableDigits(value) {
+    return Array.from(String(value || "")).map((character) => {
+        const codePoint = character.codePointAt(0);
+        if (typeof codePoint !== "number") {
+            return character;
+        }
+
+        if (codePoint >= 0x0966 && codePoint <= 0x096F) {
+            return String(codePoint - 0x0966);
+        }
+
+        if (codePoint >= 0x0660 && codePoint <= 0x0669) {
+            return String(codePoint - 0x0660);
+        }
+
+        if (codePoint >= 0x06F0 && codePoint <= 0x06F9) {
+            return String(codePoint - 0x06F0);
+        }
+
+        if (codePoint >= 0xFF10 && codePoint <= 0xFF19) {
+            return String(codePoint - 0xFF10);
+        }
+
+        return character;
+    }).join("");
+}
+
+function getNaturalSortLabel(value) {
+    const raw = normalizeSortableDigits(value)
+        .normalize("NFKC")
+        .replace(/\s+/g, " ")
+        .trim();
+    const parsed = path.parse(raw);
+    return {
+        raw,
+        base: parsed.ext ? parsed.name : raw
+    };
+}
+
+function compareNaturalNames(leftValue, rightValue) {
+    const left = getNaturalSortLabel(leftValue);
+    const right = getNaturalSortLabel(rightValue);
+    const baseCompare = left.base.localeCompare(right.base, undefined, {
+        numeric: true,
+        sensitivity: "base"
+    });
+    if (baseCompare !== 0) {
+        return baseCompare;
+    }
+
+    return left.raw.localeCompare(right.raw, undefined, {
+        numeric: true,
+        sensitivity: "base"
+    });
 }
 
 function normalizeClassLevel(value) {
@@ -142,7 +200,7 @@ function assertPathInsideRoot(rootPath, candidatePath) {
 
 async function getSortedDirectoryEntries(directoryPath) {
     const entries = await fsp.readdir(directoryPath, { withFileTypes: true });
-    return entries.sort((left, right) => left.name.localeCompare(right.name, undefined, { numeric: true, sensitivity: "base" }));
+    return entries.sort((left, right) => compareNaturalNames(left.name, right.name));
 }
 
 function createFileRecord({ classLevel, relativePath, parentPath, entryName, stats, isFreePreview = false }) {
@@ -403,13 +461,26 @@ async function getLibraryTree(classLevel) {
         return cachedTree;
     }
 
-    const classRoot = await ensureClassRoot(normalizedClass);
-    const entries = await getSortedDirectoryEntries(classRoot);
-    const subjects = [];
+    await ensureLibraryRoot();
+    const classRoot = getClassRoot(normalizedClass);
+    const hasClassRoot = await fsp.access(classRoot, fs.constants.F_OK)
+        .then(() => true)
+        .catch(() => false);
+    if (!hasClassRoot) {
+        return {
+            classLevel: normalizedClass,
+            classDirectory: getClassDirectoryName(normalizedClass),
+            subjects: [],
+            subjectCount: 0,
+            totalFileCount: 0,
+            freeFileCount: 0
+        };
+    }
 
-    for (const entry of entries) {
+    const entries = await getSortedDirectoryEntries(classRoot);
+    const subjects = (await Promise.all(entries.map(async (entry) => {
         if (!entry.isDirectory()) {
-            continue;
+            return null;
         }
 
         const relativeSubjectPath = entry.name;
@@ -424,7 +495,7 @@ async function getLibraryTree(classLevel) {
         const freeSummary = markSingleSubjectFreePreview(subjectNode);
         const allFiles = collectFiles(subjectNode, []);
 
-        subjects.push({
+        return {
             id: relativeSubjectPath
                 .toLowerCase()
                 .replace(/[^a-z0-9]+/g, "-")
@@ -439,8 +510,8 @@ async function getLibraryTree(classLevel) {
             freeFileCount: freeSummary.freeCount,
             folderCount: countFolders(subjectNode),
             tree: subjectNode
-        });
-    }
+        };
+    }))).filter(Boolean);
 
     const totalFileCount = subjects.reduce((sum, subject) => sum + Number(subject.fileCount || 0), 0);
     const freeFileCount = subjects.reduce((sum, subject) => sum + Number(subject.freeFileCount || 0), 0);
@@ -865,6 +936,7 @@ module.exports = {
     normalizeRelativePath,
     sanitizeUploadFileName,
     sanitizeFolderSegment,
+    compareNaturalNames,
     getMimeType,
     isImageFile,
     findFolderNode,
