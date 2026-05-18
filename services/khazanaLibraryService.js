@@ -193,6 +193,10 @@ function sanitizeUploadFileName(value) {
     return baseName || "file";
 }
 
+function sanitizeMetaEntryName(value) {
+    return path.basename(String(value || "").trim()).replace(/[<>:"/\\|?*\u0000-\u001F]/g, "_");
+}
+
 function getFolderMetaPath(directoryPath) {
     return path.join(directoryPath, FOLDER_META_FILE_NAME);
 }
@@ -210,10 +214,12 @@ function sanitizeOrderNumber(value) {
 
 function normalizeFolderMeta(meta = {}) {
     const files = {};
+    const folders = {};
     const inputFiles = meta?.files && typeof meta.files === "object" ? meta.files : {};
+    const inputFolders = meta?.folders && typeof meta.folders === "object" ? meta.folders : {};
 
     Object.entries(inputFiles).forEach(([fileName, entry]) => {
-        const safeFileName = sanitizeUploadFileName(fileName);
+        const safeFileName = sanitizeMetaEntryName(fileName);
         const orderNumber = sanitizeOrderNumber(entry?.orderNumber ?? entry);
         if (!safeFileName || orderNumber === null) {
             return;
@@ -224,7 +230,19 @@ function normalizeFolderMeta(meta = {}) {
         };
     });
 
-    return { files };
+    Object.entries(inputFolders).forEach(([folderName, entry]) => {
+        const safeFolderName = sanitizeMetaEntryName(folderName);
+        const orderNumber = sanitizeOrderNumber(entry?.orderNumber ?? entry);
+        if (!safeFolderName || orderNumber === null) {
+            return;
+        }
+        folders[safeFolderName] = {
+            orderNumber,
+            manual: Boolean(entry?.manual)
+        };
+    });
+
+    return { files, folders };
 }
 
 async function readFolderMeta(directoryPath) {
@@ -241,9 +259,10 @@ async function readFolderMeta(directoryPath) {
 
 async function writeFolderMeta(directoryPath, meta = {}) {
     const normalized = normalizeFolderMeta(meta);
-    const entries = Object.entries(normalized.files || {});
+    const hasFiles = Object.keys(normalized.files || {}).length > 0;
+    const hasFolders = Object.keys(normalized.folders || {}).length > 0;
     const metaPath = getFolderMetaPath(directoryPath);
-    if (!entries.length) {
+    if (!hasFiles && !hasFolders) {
         try {
             await fsp.unlink(metaPath);
         } catch (error) {
@@ -332,11 +351,43 @@ function createFileRecord({ classLevel, relativePath, parentPath, entryName, sta
     };
 }
 
+function createFolderRecord({ classLevel, relativePath, entryName, orderNumber = null, folders = [], files = [] }) {
+    return {
+        type: "folder",
+        name: entryName,
+        classLevel,
+        relativePath: relativePath.replace(/\\/g, "/"),
+        parentPath: path.posix.dirname(relativePath).replace(/\\/g, "/") === "."
+            ? ""
+            : path.posix.dirname(relativePath).replace(/\\/g, "/"),
+        orderNumber: sanitizeOrderNumber(orderNumber),
+        folders,
+        files
+    };
+}
+
 function readManualOrderNumber(metaEntry) {
     if (!metaEntry || typeof metaEntry !== "object" || !metaEntry.manual) {
         return null;
     }
     return sanitizeOrderNumber(metaEntry.orderNumber);
+}
+
+function sortFolderRecords(folderRecords = []) {
+    return folderRecords.sort((left, right) => {
+        const leftOrder = sanitizeOrderNumber(left?.orderNumber);
+        const rightOrder = sanitizeOrderNumber(right?.orderNumber);
+        if (leftOrder !== null && rightOrder !== null && leftOrder !== rightOrder) {
+            return leftOrder - rightOrder;
+        }
+        if (leftOrder !== null && rightOrder === null) {
+            return -1;
+        }
+        if (leftOrder === null && rightOrder !== null) {
+            return 1;
+        }
+        return compareNaturalNames(left?.name || "", right?.name || "");
+    });
 }
 
 function sortFileRecords(fileRecords = []) {
@@ -366,7 +417,8 @@ async function buildFolderNode(classLevel, absoluteFolderPath, relativeFolderPat
         if (entry.isDirectory()) {
             return {
                 kind: "folder",
-                value: await buildFolderNode(classLevel, entryAbsolutePath, entryRelativePath)
+                value: await buildFolderNode(classLevel, entryAbsolutePath, entryRelativePath),
+                entryName: entry.name
             };
         }
 
@@ -383,27 +435,34 @@ async function buildFolderNode(classLevel, absoluteFolderPath, relativeFolderPat
                 parentPath: relativeFolderPath,
                 entryName: entry.name,
                 stats,
-                orderNumber: readManualOrderNumber(folderMeta.files?.[sanitizeUploadFileName(entry.name)])
+                orderNumber: readManualOrderNumber(folderMeta.files?.[sanitizeMetaEntryName(entry.name)])
             })
         };
     }));
 
     const folders = resolvedEntries
         .filter((entry) => entry?.kind === "folder" && entry.value)
-        .map((entry) => entry.value);
+        .map((entry) => createFolderRecord({
+            classLevel,
+            relativePath: entry.value.relativePath,
+            entryName: entry.entryName || entry.value.name,
+            orderNumber: readManualOrderNumber(folderMeta.folders?.[sanitizeMetaEntryName(entry.entryName || entry.value.name)]),
+            folders: entry.value.folders || [],
+            files: entry.value.files || []
+        }));
     const files = resolvedEntries
         .filter((entry) => entry?.kind === "file" && entry.value)
         .map((entry) => entry.value);
+    sortFolderRecords(folders);
     sortFileRecords(files);
 
-    return {
-        type: "folder",
-        name: path.basename(absoluteFolderPath),
+    return createFolderRecord({
         classLevel,
         relativePath: relativeFolderPath.replace(/\\/g, "/"),
+        entryName: path.basename(absoluteFolderPath),
         folders,
         files
-    };
+    });
 }
 
 function isImageFile(file = {}) {
@@ -475,7 +534,7 @@ function pickPreferredFreePreviewFile(files = []) {
     return pdfFile || list[0] || null;
 }
 
-function markSingleSubjectFreePreview(folderNode) {
+function markFolderFreePreviews(folderNode) {
     if (!folderNode || typeof folderNode !== "object") {
         return {
             freeCount: 0,
@@ -483,32 +542,35 @@ function markSingleSubjectFreePreview(folderNode) {
         };
     }
 
-    resetFolderFreePreview(folderNode);
-    const allFiles = collectFiles(folderNode, []);
-    const freeFile = pickPreferredFreePreviewFile(allFiles);
-    if (!freeFile?.relativePath) {
-        return {
-            freeCount: 0,
-            freeRelativePath: ""
-        };
+    folderNode.files = (folderNode.files || []).map((file) => ({
+        ...file,
+        isFreePreview: false
+    }));
+    const directPreview = pickPreferredFreePreviewFile(folderNode.files || []);
+    let freeCount = 0;
+    let freeRelativePath = "";
+
+    if (directPreview?.relativePath) {
+        const targetPath = String(directPreview.relativePath || "").replace(/\\/g, "/");
+        folderNode.files = (folderNode.files || []).map((file) => ({
+            ...file,
+            isFreePreview: String(file.relativePath || "").replace(/\\/g, "/") === targetPath
+        }));
+        freeCount += 1;
+        freeRelativePath = targetPath;
     }
 
-    const freeRelativePath = String(freeFile.relativePath || "").replace(/\\/g, "/");
-    const applyPreviewFlag = (node) => {
-        node.files = (node.files || []).map((file) => ({
-            ...file,
-            isFreePreview: String(file.relativePath || "").replace(/\\/g, "/") === freeRelativePath
-        }));
-        node.folders = (node.folders || []).map((folder) => {
-            applyPreviewFlag(folder);
-            return folder;
-        });
-    };
-
-    applyPreviewFlag(folderNode);
+    folderNode.folders = (folderNode.folders || []).map((folder) => {
+        const childSummary = markFolderFreePreviews(folder);
+        freeCount += Number(childSummary.freeCount || 0);
+        if (!freeRelativePath && childSummary.freeRelativePath) {
+            freeRelativePath = String(childSummary.freeRelativePath || "").replace(/\\/g, "/");
+        }
+        return folder;
+    });
 
     return {
-        freeCount: 1,
+        freeCount,
         freeRelativePath
     };
 }
@@ -635,7 +697,7 @@ async function getLibraryTree(classLevel) {
 
         const coverFile = pickSubjectCoverFile(subjectNode);
         subjectNode.files = (subjectNode.files || []).filter((file) => !isImageFile(file));
-        const freeSummary = markSingleSubjectFreePreview(subjectNode);
+        const freeSummary = markFolderFreePreviews(subjectNode);
         const allFiles = collectFiles(subjectNode, []);
 
         return {
@@ -1113,6 +1175,77 @@ async function setFileOrder({ classLevel, relativePath, orderNumber }) {
     };
 }
 
+async function setFolderListingOrder({ classLevel, folderPath, fileRelativePaths = null, folderRelativePaths = null }) {
+    const normalizedClass = ensureValidClassLevel(classLevel);
+    const normalizedFolderPath = normalizeRelativePath(folderPath, { allowEmpty: false });
+    const classRoot = await ensureClassRoot(normalizedClass);
+    const absoluteFolderPath = assertPathInsideRoot(classRoot, path.join(classRoot, normalizedFolderPath));
+    const stats = await fsp.stat(absoluteFolderPath);
+    if (!stats.isDirectory()) {
+        throw new Error("Requested folder does not exist.");
+    }
+
+    const entries = await getSortedDirectoryEntries(absoluteFolderPath);
+    const existingFileNames = new Set(entries.filter((entry) => entry.isFile()).map((entry) => sanitizeMetaEntryName(entry.name)));
+    const existingFolderNames = new Set(entries.filter((entry) => entry.isDirectory()).map((entry) => sanitizeMetaEntryName(entry.name)));
+    const folderMeta = await readFolderMeta(absoluteFolderPath);
+
+    if (Array.isArray(fileRelativePaths)) {
+        const nextFilesMeta = {};
+        const seen = new Set();
+        fileRelativePaths.forEach((relativePath, index) => {
+            const normalizedRelativePath = normalizeRelativePath(relativePath, { allowEmpty: false });
+            const expectedParent = path.posix.dirname(normalizedRelativePath);
+            if ((expectedParent === "." ? "" : expectedParent) !== normalizedFolderPath) {
+                throw new Error("File order payload contains files outside the selected folder.");
+            }
+            const fileName = sanitizeMetaEntryName(path.posix.basename(normalizedRelativePath));
+            if (!existingFileNames.has(fileName) || seen.has(fileName)) {
+                return;
+            }
+            seen.add(fileName);
+            nextFilesMeta[fileName] = {
+                orderNumber: index + 1,
+                manual: true
+            };
+        });
+        folderMeta.files = nextFilesMeta;
+    }
+
+    if (Array.isArray(folderRelativePaths)) {
+        const nextFoldersMeta = {};
+        const seen = new Set();
+        folderRelativePaths.forEach((relativePath, index) => {
+            const normalizedRelativePath = normalizeRelativePath(relativePath, { allowEmpty: false });
+            const expectedParent = path.posix.dirname(normalizedRelativePath);
+            if ((expectedParent === "." ? "" : expectedParent) !== normalizedFolderPath) {
+                throw new Error("Folder order payload contains folders outside the selected folder.");
+            }
+            const folderName = sanitizeMetaEntryName(path.posix.basename(normalizedRelativePath));
+            if (!existingFolderNames.has(folderName) || seen.has(folderName)) {
+                return;
+            }
+            seen.add(folderName);
+            nextFoldersMeta[folderName] = {
+                orderNumber: index + 1,
+                manual: true
+            };
+        });
+        folderMeta.folders = nextFoldersMeta;
+    }
+
+    await writeFolderMeta(absoluteFolderPath, folderMeta);
+    invalidateLibraryCaches(normalizedClass);
+
+    return {
+        classLevel: normalizedClass,
+        classDirectory: getClassDirectoryName(normalizedClass),
+        folderPath: normalizedFolderPath,
+        fileRelativePaths: Array.isArray(fileRelativePaths) ? fileRelativePaths.map((entry) => normalizeRelativePath(entry, { allowEmpty: false })) : null,
+        folderRelativePaths: Array.isArray(folderRelativePaths) ? folderRelativePaths.map((entry) => normalizeRelativePath(entry, { allowEmpty: false })) : null
+    };
+}
+
 function getMimeType(fileName) {
     const ext = path.extname(String(fileName || "").trim()).toLowerCase();
     const mimeTypes = {
@@ -1147,6 +1280,7 @@ module.exports = {
     renameFolder,
     renameFile,
     setFileOrder,
+    setFolderListingOrder,
     normalizeClassLevel,
     normalizeRelativePath,
     sanitizeUploadFileName,
