@@ -739,6 +739,27 @@ app.post("/api/admin/khazana/library/file/order", verifyFirebaseUser, requireAdm
     }
 });
 
+app.post("/api/admin/khazana/library/order", verifyFirebaseUser, requireAdminUser, async (req, res) => {
+    try {
+        const payload = await khazanaLibraryService.setFolderListingOrder({
+            classLevel: req.body?.classLevel,
+            folderPath: req.body?.folderPath,
+            fileRelativePaths: Array.isArray(req.body?.fileRelativePaths) ? req.body.fileRelativePaths : null,
+            folderRelativePaths: Array.isArray(req.body?.folderRelativePaths) ? req.body.folderRelativePaths : null
+        });
+
+        res.json({
+            success: true,
+            ...payload
+        });
+    } catch (error) {
+        console.error("Failed to update Khazana folder listing order:", error);
+        res.status(400).json({
+            message: error?.message || "Unable to update the folder listing order."
+        });
+    }
+});
+
 app.post("/api/admin/khazana/library/folder/delete", verifyFirebaseUser, requireAdminUser, async (req, res) => {
     try {
         const classLevel = normalizeClassLevel(req.body?.classLevel);
@@ -835,6 +856,21 @@ app.post("/api/admin/khazana/library/file-link", verifyFirebaseUser, requireAdmi
     }
 });
 
+app.post("/api/admin/khazana/library/file-stream", verifyFirebaseUser, requireAdminUser, async (req, res) => {
+    try {
+        const access = await resolveAdminLibraryFileAccess(req.body || {});
+        await streamKhazanaLibraryFile(req, res, access, {
+            disposition: req.body?.disposition
+        });
+    } catch (error) {
+        const statusCode = readStructuredErrorStatus(error, /not found|missing|does not exist/i.test(String(error?.message || "")) ? 404 : 500);
+        console.error("Failed to stream admin Khazana library file:", error);
+        res.status(statusCode).json({
+            message: error?.message || "Unable to stream the requested admin file."
+        });
+    }
+});
+
 app.get("/api/admin/khazana/analytics", verifyFirebaseUser, requireAdminUser, async (_req, res) => {
     try {
         const analytics = await buildAdminKhazanaAnalyticsPayload();
@@ -852,45 +888,9 @@ app.get("/api/admin/khazana/analytics", verifyFirebaseUser, requireAdminUser, as
 
 app.post("/api/khazana/library/file-link", async (req, res) => {
     try {
-        const classLevel = normalizeClassLevel(req.body?.classLevel);
-        const relativePath = String(req.body?.relativePath || "").trim();
         const requestedDisposition = String(req.body?.disposition || "inline").trim().toLowerCase();
         const disposition = requestedDisposition === "attachment" ? "attachment" : "inline";
-
-        if (!classLevel || !relativePath) {
-            res.status(400).json({ message: "Class level and file path are required." });
-            return;
-        }
-
-        const fileRecord = await khazanaLibraryService.getFileRecord(classLevel, relativePath);
-        if (!fileRecord?.file) {
-            res.status(404).json({ message: "Requested Khazana file was not found." });
-            return;
-        }
-
-        const isFreePreview = Boolean(fileRecord.file.isFreePreview);
-        let verifiedUser = null;
-
-        try {
-            verifiedUser = await readVerifiedFirebaseUserFromRequest(req);
-        } catch (_) {
-            verifiedUser = null;
-        }
-
-        if (!isFreePreview) {
-            if (!verifiedUser) {
-                res.status(403).json({ message: "Purchase is required to unlock this file." });
-                return;
-            }
-
-            await refreshKhazanaClassConfig();
-            const accessSummary = await ensureUserAccessForVerifiedUser(verifiedUser);
-            const normalizedAccess = normalizeAccessSummary(accessSummary);
-            if (!hasCompletedClassAccess(normalizedAccess[classLevel])) {
-                res.status(403).json({ message: "Purchase is required to unlock this file." });
-                return;
-            }
-        }
+        const { classLevel, fileRecord, isFreePreview } = await resolvePublicLibraryFileAccess(req);
 
         const token = createLibraryFileAccessToken({
             classLevel,
@@ -908,9 +908,34 @@ app.post("/api/khazana/library/file-link", async (req, res) => {
         });
     } catch (error) {
         console.error("Failed to create Khazana library file link:", error);
-        const statusCode = /purchase is required/i.test(String(error?.message || "")) ? 403 : 500;
+        const statusCode = readStructuredErrorStatus(
+            error,
+            /purchase is required/i.test(String(error?.message || "")) ? 403 : 500
+        );
         res.status(statusCode).json({
             message: error?.message || "Unable to prepare the requested file."
+        });
+    }
+});
+
+app.post("/api/khazana/library/file-stream", async (req, res) => {
+    try {
+        const access = await resolvePublicLibraryFileAccess(req);
+        await streamKhazanaLibraryFile(req, res, {
+            classLevel: access.classLevel,
+            relativePath: access.fileRecord.file.relativePath,
+            fileName: access.fileRecord.file.name
+        }, {
+            disposition: req.body?.disposition
+        });
+    } catch (error) {
+        const statusCode = readStructuredErrorStatus(
+            error,
+            /purchase is required/i.test(String(error?.message || "")) ? 403 : 500
+        );
+        console.error("Failed to stream Khazana library file via authenticated access:", error);
+        res.status(statusCode).json({
+            message: error?.message || "Unable to stream the requested file."
         });
     }
 });
@@ -1010,6 +1035,50 @@ app.post("/api/khazana/book-access", verifyFirebaseUser, async (req, res) => {
         const statusCode = /purchase|not purchased|not unlocked/i.test(String(error?.message || "")) ? 403 : 500;
         res.status(statusCode).json({
             message: error?.message || "Unable to create secure Khazana book link."
+        });
+    }
+});
+
+app.post("/api/khazana/book-stream", verifyFirebaseUser, async (req, res) => {
+    try {
+        await refreshKhazanaClassConfig();
+        await ensureUserAccessForVerifiedUser(req.user);
+
+        const classLevel = normalizeClassLevel(req.body?.classLevel);
+        const bookId = String(req.body?.bookId || "").trim();
+        if (!classLevel || !bookId) {
+            res.status(400).json({ message: "Book access payload is incomplete." });
+            return;
+        }
+
+        const resolvedBook = await resolveKhazanaBookFileForUser({
+            uid: req.user.uid,
+            classLevel,
+            bookId
+        });
+
+        if (!resolvedBook) {
+            res.status(404).json({ message: "Book file is not mapped yet for this subject." });
+            return;
+        }
+
+        await streamKhazanaBookFile(req, res, {
+            uid: req.user.uid,
+            classLevel,
+            bookId,
+            storagePath: resolvedBook.storagePath,
+            fileName: resolvedBook.fileName
+        }, {
+            disposition: req.body?.disposition
+        });
+    } catch (error) {
+        const statusCode = readStructuredErrorStatus(
+            error,
+            /purchase|not purchased|not unlocked/i.test(String(error?.message || "")) ? 403 : 500
+        );
+        console.error("Failed to stream secure Khazana book file via authenticated access:", error);
+        res.status(statusCode).json({
+            message: error?.message || "Unable to stream the requested book file."
         });
     }
 });
@@ -1670,6 +1739,75 @@ async function readVerifiedFirebaseUserFromRequest(req) {
     }
 
     return admin.auth().verifyIdToken(token);
+}
+
+function createStructuredError(statusCode, message) {
+    const error = new Error(message || "Request failed.");
+    error.statusCode = Number(statusCode) || 500;
+    return error;
+}
+
+function readStructuredErrorStatus(error, fallbackStatusCode = 500) {
+    const statusCode = Number(error?.statusCode);
+    return Number.isInteger(statusCode) && statusCode >= 400 ? statusCode : fallbackStatusCode;
+}
+
+async function resolveAdminLibraryFileAccess(payload = {}) {
+    const classLevel = normalizeClassLevel(payload?.classLevel);
+    const relativePath = String(payload?.relativePath || "").trim();
+
+    if (!classLevel || !relativePath) {
+        throw createStructuredError(400, "Class level and file path are required.");
+    }
+
+    const fileRecord = await khazanaLibraryService.getFileRecord(classLevel, relativePath);
+    if (!fileRecord?.file) {
+        throw createStructuredError(404, "Requested Khazana file was not found.");
+    }
+
+    return {
+        classLevel,
+        relativePath: fileRecord.file.relativePath,
+        fileName: fileRecord.file.name
+    };
+}
+
+async function resolvePublicLibraryFileAccess(req) {
+    const classLevel = normalizeClassLevel(req.body?.classLevel);
+    const relativePath = String(req.body?.relativePath || "").trim();
+
+    if (!classLevel || !relativePath) {
+        throw createStructuredError(400, "Class level and file path are required.");
+    }
+
+    let verifiedUser;
+    try {
+        verifiedUser = await readVerifiedFirebaseUserFromRequest(req);
+    } catch (_) {
+        throw createStructuredError(401, "Login is required to open or download this file.");
+    }
+
+    const fileRecord = await khazanaLibraryService.getFileRecord(classLevel, relativePath);
+    if (!fileRecord?.file) {
+        throw createStructuredError(404, "Requested Khazana file was not found.");
+    }
+
+    const isFreePreview = Boolean(fileRecord.file.isFreePreview);
+    if (!isFreePreview) {
+        await refreshKhazanaClassConfig();
+        const accessSummary = await ensureUserAccessForVerifiedUser(verifiedUser);
+        const normalizedAccess = normalizeAccessSummary(accessSummary);
+        if (!hasCompletedClassAccess(normalizedAccess[classLevel])) {
+            throw createStructuredError(403, "Purchase is required to unlock this file.");
+        }
+    }
+
+    return {
+        verifiedUser,
+        classLevel,
+        fileRecord,
+        isFreePreview
+    };
 }
 
 async function requireAdminUser(req, res, next) {
@@ -3234,7 +3372,7 @@ async function streamKhazanaLibraryFile(req, res, accessPayload, options = {}) {
     const stats = await fs.promises.stat(absoluteFilePath);
     const totalSize = Number(stats.size || 0);
     const contentType = khazanaLibraryService.getMimeType(accessPayload.fileName || absoluteFilePath);
-    const disposition = String(req.query?.disposition || "").trim().toLowerCase() === "attachment"
+    const disposition = String(options.disposition || req.query?.disposition || "").trim().toLowerCase() === "attachment"
         ? "attachment"
         : "inline";
     const fileName = sanitizeDownloadFileName(accessPayload.fileName || path.basename(absoluteFilePath));
@@ -3311,7 +3449,7 @@ async function streamKhazanaBookFile(req, res, accessPayload, options = {}) {
     const [metadata] = await file.getMetadata();
     const totalSize = Number(metadata?.size || 0);
     const contentType = String(metadata?.contentType || "application/pdf").trim() || "application/pdf";
-    const disposition = String(req.query?.disposition || "").trim().toLowerCase() === "attachment"
+    const disposition = String(options.disposition || req.query?.disposition || "").trim().toLowerCase() === "attachment"
         ? "attachment"
         : "inline";
     const fileName = sanitizeDownloadFileName(accessPayload.fileName || path.basename(storagePath));
