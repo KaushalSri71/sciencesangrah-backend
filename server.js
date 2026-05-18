@@ -12,6 +12,7 @@ const whatsappCompatRouter = require("./routes/whatsappRoutes");
 const whatsappRouter = require("./routes/whatsapp");
 const { initWhatsApp } = require("./services/whatsappService");
 const khazanaLibraryService = require("./services/khazanaLibraryService");
+const { resolveBookAccessTokenSecret } = require("./utils/khazanaTokenSecurity");
 const dotenv = require("dotenv");
 
 [
@@ -41,7 +42,16 @@ const ALLOWED_ORIGINS = String(process.env.ALLOWED_ORIGINS || DEFAULT_ALLOWED_OR
 const FIREBASE_PROJECT_ID = String(process.env.FIREBASE_PROJECT_ID || "science-sangrah-5067f").trim();
 const FIREBASE_DATABASE_URL = String(process.env.FIREBASE_DATABASE_URL || `https://${FIREBASE_PROJECT_ID}-default-rtdb.firebaseio.com`).trim();
 const FIREBASE_STORAGE_BUCKET = String(process.env.FIREBASE_STORAGE_BUCKET || "").trim();
-const BOOK_ACCESS_TOKEN_SECRET = String(process.env.BOOK_ACCESS_TOKEN_SECRET || "").trim() || crypto.randomBytes(32).toString("hex");
+const BOOK_ACCESS_TOKEN_SECRET_RESOLUTION = resolveBookAccessTokenSecret({
+    explicitSecret: process.env.BOOK_ACCESS_TOKEN_SECRET,
+    firebaseServiceAccountJson: process.env.FIREBASE_SERVICE_ACCOUNT_JSON,
+    localServiceAccountPath: path.join(__dirname, "serviceAccount.json"),
+    razorpayKeySecret: process.env.RAZORPAY_KEY_SECRET,
+    firebaseProjectId: FIREBASE_PROJECT_ID,
+    firebaseStorageBucket: FIREBASE_STORAGE_BUCKET,
+    frontendOrigin: FRONTEND_ORIGIN
+});
+const BOOK_ACCESS_TOKEN_SECRET = BOOK_ACCESS_TOKEN_SECRET_RESOLUTION.secret;
 const BOOK_ACCESS_TOKEN_TTL_MS = 5 * 60 * 1000;
 
 const RAZORPAY_KEY_ID = String(process.env.RAZORPAY_KEY_ID || "").trim();
@@ -73,8 +83,28 @@ let classConfigRefreshPromise = null;
 const BOOK_FILE_RESOLUTION_CACHE_TTL_MS = 10 * 60 * 1000;
 const bookFileResolutionCache = new Map();
 const KHAZANA_METRICS_DOC_ID = "downloads";
+const CORS_ALLOWED_METHODS = ["GET", "HEAD", "POST", "OPTIONS"];
+const CORS_ALLOWED_HEADERS = [
+    "Authorization",
+    "Content-Type",
+    "X-Admin-Uid",
+    "X-Admin-Email",
+    "X-Admin-Role",
+    "X-Class-Level",
+    "X-Folder-Path",
+    "X-File-Name"
+];
+const CORS_EXPOSED_HEADERS = [
+    "Content-Length",
+    "Content-Type",
+    "Content-Disposition"
+];
 
-app.use(cors({
+if (BOOK_ACCESS_TOKEN_SECRET_RESOLUTION.isWeakFallback) {
+    console.warn(`BOOK_ACCESS_TOKEN_SECRET is not configured. Falling back to deterministic ${BOOK_ACCESS_TOKEN_SECRET_RESOLUTION.source} signing for Khazana file tokens.`);
+}
+
+const corsOptions = {
     origin(origin, callback) {
         if (!origin || isAllowedRequestOrigin(origin)) {
             callback(null, true);
@@ -83,8 +113,15 @@ app.use(cors({
 
         callback(null, false);
     },
-    credentials: true
-}));
+    credentials: true,
+    methods: CORS_ALLOWED_METHODS,
+    allowedHeaders: CORS_ALLOWED_HEADERS,
+    exposedHeaders: CORS_EXPOSED_HEADERS,
+    optionsSuccessStatus: 204
+};
+
+app.use(cors(corsOptions));
+app.options(/.*/, cors(corsOptions));
 app.use(express.json());
 app.use("/api", dashboardRouter);
 app.use("/api", chatRouter);
@@ -678,6 +715,26 @@ app.post("/api/admin/khazana/library/file/rename", verifyFirebaseUser, requireAd
         const statusCode = /already exists|invalid|does not exist|not found/i.test(String(error?.message || "")) ? 400 : 500;
         res.status(statusCode).json({
             message: error?.message || "Unable to rename the requested file."
+        });
+    }
+});
+
+app.post("/api/admin/khazana/library/file/order", verifyFirebaseUser, requireAdminUser, async (req, res) => {
+    try {
+        const payload = await khazanaLibraryService.setFileOrder({
+            classLevel: req.body?.classLevel,
+            relativePath: req.body?.relativePath,
+            orderNumber: req.body?.orderNumber
+        });
+
+        res.json({
+            success: true,
+            ...payload
+        });
+    } catch (error) {
+        console.error("Failed to update Khazana file order:", error);
+        res.status(400).json({
+            message: error?.message || "Unable to update the file order."
         });
     }
 });
@@ -3018,7 +3075,6 @@ function createLibraryFileAccessToken(payload = {}) {
     const data = {
         classLevel: normalizeClassLevel(payload.classLevel),
         relativePath: String(payload.relativePath || "").trim(),
-        fileName: String(payload.fileName || "").trim(),
         exp: Date.now() + BOOK_ACCESS_TOKEN_TTL_MS
     };
 
