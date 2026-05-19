@@ -3095,6 +3095,27 @@ function sanitizeDownloadFileName(fileName) {
     return normalized || "notes.pdf";
 }
 
+function sanitizeHeaderFallbackFileName(fileName) {
+    const normalized = sanitizeDownloadFileName(fileName);
+    const asciiName = normalized
+        .normalize("NFKD")
+        .replace(/[^\x20-\x7E]+/g, "_")
+        .replace(/["\\]/g, "_")
+        .replace(/\s+/g, " ")
+        .trim();
+
+    return asciiName && /[A-Za-z0-9]/.test(asciiName) ? asciiName : "notes.pdf";
+}
+
+function buildContentDispositionHeader(disposition, fileName) {
+    const safeDisposition = String(disposition || "").trim().toLowerCase() === "attachment"
+        ? "attachment"
+        : "inline";
+    const safeFileName = sanitizeDownloadFileName(fileName);
+    const fallbackFileName = sanitizeHeaderFallbackFileName(safeFileName);
+    return `${safeDisposition}; filename="${fallbackFileName}"; filename*=UTF-8''${encodeURIComponent(safeFileName)}`;
+}
+
 function createBookAccessToken(payload = {}) {
     const data = {
         uid: String(payload.uid || "").trim(),
@@ -3305,7 +3326,7 @@ async function streamKhazanaClassBundle(req, res, accessPayload) {
 
     res.setHeader("Content-Type", "application/zip");
     res.setHeader("Cache-Control", "private, no-store, max-age=0");
-    res.setHeader("Content-Disposition", `attachment; filename="${fileName}"; filename*=UTF-8''${encodeURIComponent(fileName)}`);
+    res.setHeader("Content-Disposition", buildContentDispositionHeader("attachment", fileName));
 
     if (bundle.libraryCount > 0) {
         void recordKhazanaPdfDownload(classLevel, "library", bundle.libraryCount).catch((error) => {
@@ -3376,12 +3397,11 @@ async function streamKhazanaLibraryFile(req, res, accessPayload, options = {}) {
         ? "attachment"
         : "inline";
     const fileName = sanitizeDownloadFileName(accessPayload.fileName || path.basename(absoluteFilePath));
-    const contentDisposition = `${disposition}; filename="${fileName}"; filename*=UTF-8''${encodeURIComponent(fileName)}`;
 
     res.setHeader("Content-Type", contentType);
     res.setHeader("Accept-Ranges", "bytes");
     res.setHeader("Cache-Control", "private, no-store, max-age=0");
-    res.setHeader("Content-Disposition", contentDisposition);
+    res.setHeader("Content-Disposition", buildContentDispositionHeader(disposition, fileName));
 
     const rangeHeader = String(req.headers.range || "").trim();
     const range = parseHttpRange(rangeHeader, totalSize);
@@ -3453,12 +3473,11 @@ async function streamKhazanaBookFile(req, res, accessPayload, options = {}) {
         ? "attachment"
         : "inline";
     const fileName = sanitizeDownloadFileName(accessPayload.fileName || path.basename(storagePath));
-    const contentDisposition = `${disposition}; filename="${fileName}"; filename*=UTF-8''${encodeURIComponent(fileName)}`;
 
     res.setHeader("Content-Type", contentType);
     res.setHeader("Accept-Ranges", "bytes");
     res.setHeader("Cache-Control", "private, no-store, max-age=0");
-    res.setHeader("Content-Disposition", contentDisposition);
+    res.setHeader("Content-Disposition", buildContentDispositionHeader(disposition, fileName));
 
     const rangeHeader = String(req.headers.range || "").trim();
     const range = parseHttpRange(rangeHeader, totalSize);
