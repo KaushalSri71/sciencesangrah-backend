@@ -1,5 +1,6 @@
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const express = require("express");
 
 const PUBLIC_FIREBASE_CONFIG = {
@@ -177,6 +178,97 @@ function createLiveEventRouter({ admin, projectId, databaseUrl }) {
             console.error("Failed to bootstrap live event:", error);
             res.status(500).json({
                 message: error?.message || "Unable to bootstrap the live event."
+            });
+        }
+    });
+
+    router.get("/certificate", async (req, res) => {
+        try {
+            const verifiedUser = await readVerifiedFirebaseUserFromRequest(req).catch(() => null);
+            const uid = String(verifiedUser?.uid || verifiedUser?.user_id || "").trim();
+
+            if (!uid) {
+                res.status(401).json({
+                    eligible: false,
+                    reason: "auth_required",
+                    message: "Please login first to download your certificate."
+                });
+                return;
+            }
+
+            const [participantSnapshot, leaderboardSnapshot, sessionSnapshot, adminSnapshot, userSnapshot] = await Promise.all([
+                firestore.collection("liveEvent").doc("session").collection("participants").doc(uid).get(),
+                firestore.collection("liveEvent").doc("session").collection("leaderboard").doc(uid).get(),
+                firestore.collection("liveEvent").doc("session").collection("current").doc("state").get(),
+                firestore.collection("admins").doc(uid).get(),
+                firestore.collection("users").doc(uid).get()
+            ]);
+
+            const participant = participantSnapshot.exists ? (participantSnapshot.data() || {}) : null;
+            const leaderboard = leaderboardSnapshot.exists ? (leaderboardSnapshot.data() || {}) : null;
+            const adminProfile = adminSnapshot.exists ? (adminSnapshot.data() || {}) : null;
+            const userProfile = userSnapshot.exists ? (userSnapshot.data() || {}) : null;
+            const eligibility = resolveCertificateEligibility({ participant, leaderboard, adminProfile });
+
+            if (!eligibility.eligible) {
+                const denialMessageByReason = {
+                    participation_not_found: "Certificate is not available for this account.",
+                    leaderboard_not_published: "Certificate will be available after final rankings are published.",
+                    rank_not_eligible: "Certificate is not available for this account."
+                };
+
+                res.setHeader("Cache-Control", "no-store, max-age=0");
+                res.status(403).json({
+                    eligible: false,
+                    reason: eligibility.reason,
+                    message: denialMessageByReason[eligibility.reason] || "Certificate is not available for this account."
+                });
+                return;
+            }
+
+            const sessionData = sessionSnapshot.exists ? (sessionSnapshot.data() || {}) : {};
+            const studentName = String(
+                leaderboard?.fullName
+                || leaderboard?.name
+                || leaderboard?.displayName
+                || participant?.fullName
+                || participant?.name
+                || participant?.displayName
+                || adminProfile?.displayName
+                || adminProfile?.name
+                || userProfile?.fullName
+                || userProfile?.name
+                || userProfile?.displayName
+                || "Learner"
+            ).trim() || "Learner";
+            const districtName = String(
+                participant?.district
+                || leaderboard?.district
+                || userProfile?.district
+                || participant?.city
+                || userProfile?.city
+                || userProfile?.location
+                || participant?.location
+                || ""
+            ).trim();
+
+            res.setHeader("Cache-Control", "no-store, max-age=0");
+            res.json({
+                eligible: true,
+                studentName,
+                districtName,
+                uniqueId: uid,
+                publishedRank: Number(leaderboard?.publishedRank || 0),
+                certificateId: buildCertificateId("science-sangrah-live-quiz-2026-05-15", uid),
+                eventLabel: String(sessionData.eventLabel || sessionData.eventTitle || "Science Sangrah Live Event").trim() || "Science Sangrah Live Event",
+                eventDateLabel: "15 May 2026"
+            });
+        } catch (error) {
+            console.error("Failed to verify live event certificate eligibility:", error);
+            res.status(500).json({
+                eligible: false,
+                reason: "verification_failed",
+                message: "Unable to verify certificate right now."
             });
         }
     });
@@ -553,9 +645,49 @@ function sanitizeParticipantName(value) {
     return sanitized.slice(0, 48);
 }
 
+function resolveCertificateEligibility({ participant, leaderboard, adminProfile }) {
+    const adminRole = String(adminProfile?.role || "").trim().toLowerCase();
+    const adminStatus = String(adminProfile?.status || "").trim().toLowerCase();
+    if (adminRole === "admin" && adminStatus === "active") {
+        return { eligible: true, reason: "", viaAdminOverride: true };
+    }
+
+    if (!participant) {
+        return { eligible: false, reason: "participation_not_found" };
+    }
+
+    if (!leaderboard) {
+        return { eligible: false, reason: "leaderboard_not_published" };
+    }
+
+    const publishedRank = Number(leaderboard.publishedRank || 0);
+    if (!Number.isFinite(publishedRank) || publishedRank <= 0) {
+        return { eligible: false, reason: "leaderboard_not_published" };
+    }
+
+    if (publishedRank > 100) {
+        return { eligible: false, reason: "rank_not_eligible" };
+    }
+
+    return { eligible: true, reason: "" };
+}
+
+function buildCertificateId(eventSlug, uid) {
+    const digest = crypto
+        .createHash("sha256")
+        .update(`${String(eventSlug || "").trim()}::${String(uid || "").trim()}`)
+        .digest("hex")
+        .slice(0, 8)
+        .toUpperCase();
+
+    return `SS-LIVE-20260515-${digest}`;
+}
+
 createLiveEventRouter._test = {
     buildEventAssetPathCandidates,
-    resolveEventAssetPath
+    resolveEventAssetPath,
+    resolveCertificateEligibility,
+    buildCertificateId
 };
 
 module.exports = createLiveEventRouter;
